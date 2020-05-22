@@ -18,8 +18,17 @@ import (
 	"time"
 )
 
-var etcdURL string
-var tmpDirRoot = os.Getenv("XDG_RUNTIME_DIR") // when unset "" falls back to default
+// TODO(crawshaw): remove this hacky use of systemd tmpfs when --unsafe-no-sync is released in etcd.
+var tmpDirRoot = os.Getenv("XDG_RUNTIME_DIR")
+
+var etcdURLVal string
+
+func etcdURL(tb testing.TB) string {
+	if etcdURLVal == "" {
+		tb.Skip("skipping test, no etcd installed in PATH")
+	}
+	return etcdURLVal
+}
 
 func TestDB(t *testing.T) {
 	etcdDeleteAll(t)
@@ -31,7 +40,7 @@ func TestDB(t *testing.T) {
 	t.Run("readwrite", func(t *testing.T) {
 		opts := optsTFunc
 		opts.Logf = t.Logf
-		db, err := New(ctx, etcdURL, opts)
+		db, err := New(ctx, etcdURL(t), opts)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -53,7 +62,7 @@ func TestDB(t *testing.T) {
 	t.Run("readwrite-newdb", func(t *testing.T) {
 		opts := optsTFunc
 		opts.Logf = t.Logf
-		db, err := New(ctx, etcdURL, opts)
+		db, err := New(ctx, etcdURL(t), opts)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -73,7 +82,14 @@ func TestDB(t *testing.T) {
 
 func TestStaleTx(t *testing.T) {
 	etcdDeleteAll(t)
+	testStaleTx(t, etcdURL(t))
+}
 
+func TestStaleTxInMemory(t *testing.T) {
+	testStaleTx(t, "memory://")
+}
+
+func testStaleTx(t *testing.T, url string) {
 	watchCh := make(chan []KV, 8)
 	checkWatch := func(want []KV) {
 		t.Helper()
@@ -101,7 +117,7 @@ func TestStaleTx(t *testing.T) {
 	opts.WatchFunc = func(kvs []KV) {
 		watchCh <- kvs
 	}
-	db, err := New(ctx, etcdURL, opts)
+	db, err := New(ctx, url, opts)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -199,7 +215,14 @@ func TestStaleTx(t *testing.T) {
 
 func TestVariableKeys(t *testing.T) {
 	etcdDeleteAll(t)
+	testVariableKeys(t, etcdURL(t))
+}
 
+func TestVariableKeysInMemory(t *testing.T) {
+	testVariableKeys(t, "memory://")
+}
+
+func testVariableKeys(t *testing.T, url string) {
 	watchCh := make(chan []KV, 8)
 	ctx := context.Background()
 	opts := optsTFunc
@@ -207,7 +230,7 @@ func TestVariableKeys(t *testing.T) {
 	opts.WatchFunc = func(kvs []KV) {
 		watchCh <- kvs
 	}
-	db, err := New(ctx, etcdURL, opts)
+	db, err := New(ctx, url, opts)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -257,7 +280,7 @@ func TestExternalValue(t *testing.T) {
 	opts.WatchFunc = func(kvs []KV) {
 		watchCh <- kvs
 	}
-	db, err := New(ctx, etcdURL, opts)
+	db, err := New(ctx, etcdURL(t), opts)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -271,7 +294,7 @@ func TestExternalValue(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	out, err := exec.Command("etcdctl", "--endpoints="+etcdURL, "put", key, string(valBytes)).CombinedOutput()
+	out, err := exec.Command("etcdctl", "--endpoints="+etcdURL(t), "put", key, string(valBytes)).CombinedOutput()
 	if err != nil {
 		t.Fatalf("etcdctl put failed: %v, stderr:\n%s", err, out)
 	}
@@ -291,7 +314,7 @@ func TestExternalValue(t *testing.T) {
 func TestLoadPageLimit(t *testing.T) {
 	etcdDeleteAll(t)
 	ctx := context.Background()
-	db, err := New(ctx, etcdURL, Options{Logf: t.Logf})
+	db, err := New(ctx, etcdURL(t), Options{Logf: t.Logf})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -324,7 +347,7 @@ func TestLoadPageLimit(t *testing.T) {
 		Logf:      t.Logf,
 		WatchFunc: func(kvs []KV) { numKVs += len(kvs) },
 	}
-	db, err = New(ctx, etcdURL, opts)
+	db, err = New(ctx, etcdURL(t), opts)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -337,8 +360,16 @@ func TestLoadPageLimit(t *testing.T) {
 
 func TestGetRange(t *testing.T) {
 	etcdDeleteAll(t)
+	testGetRange(t, etcdURL(t))
+}
+
+func TestGetRangeInMemory(t *testing.T) {
+	testGetRange(t, "memory://")
+}
+
+func testGetRange(t *testing.T, url string) {
 	ctx := context.Background()
-	db, err := New(ctx, etcdURL, Options{Logf: t.Logf})
+	db, err := New(ctx, url, Options{Logf: t.Logf})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -430,7 +461,7 @@ func BenchmarkPutOver(b *testing.B) {
 	ctx := context.Background()
 	opts := optsTFunc
 	opts.Logf = b.Logf
-	db, err := New(ctx, etcdURL, opts)
+	db, err := New(ctx, etcdURL(b), opts)
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -452,7 +483,7 @@ func BenchmarkPut(b *testing.B) {
 	ctx := context.Background()
 	opts := optsTFunc
 	opts.Logf = b.Logf
-	db, err := New(ctx, etcdURL, opts)
+	db, err := New(ctx, etcdURL(b), opts)
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -478,7 +509,7 @@ func benchmarkPutX(b *testing.B, x int) {
 	ctx := context.Background()
 	opts := optsTFunc
 	opts.Logf = b.Logf
-	db, err := New(ctx, etcdURL, opts)
+	db, err := New(ctx, etcdURL(b), opts)
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -517,9 +548,9 @@ func benchmarkPutX(b *testing.B, x int) {
 }
 
 func TestMain(m *testing.M) {
-	if out, err := exec.Command("which", "etcd").CombinedOutput(); err != nil {
-		fmt.Fprintf(os.Stderr, "cannot find binary 'etcd' on PATH, skipping test: %s", out)
-		os.Exit(0)
+	if _, err := exec.Command("which", "etcd").CombinedOutput(); err != nil {
+		etcdURLVal = ""
+		os.Exit(m.Run())
 	}
 
 	url, cleanup, err := runEtcd()
@@ -527,7 +558,7 @@ func TestMain(m *testing.M) {
 		fmt.Fprintf(os.Stderr, "cannot start etcd: %v", err)
 		os.Exit(1)
 	}
-	etcdURL = url
+	etcdURLVal = url
 	exitCode := m.Run()
 	cleanup()
 	os.Exit(exitCode)
@@ -535,7 +566,7 @@ func TestMain(m *testing.M) {
 
 func etcdDeleteAll(t testing.TB) {
 	t.Helper()
-	out, err := exec.Command("etcdctl", "--endpoints="+etcdURL, "del", `""`, "--from-key=true").CombinedOutput()
+	out, err := exec.Command("etcdctl", "--endpoints="+etcdURL(t), "del", `""`, "--from-key=true").CombinedOutput()
 	if err != nil {
 		t.Logf("delete all failed:\n%s", out)
 		t.Fatal(err)

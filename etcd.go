@@ -88,9 +88,13 @@ const debug = false
 
 // DB is an in-memory cache of an etcd cluster.
 type DB struct {
-	url  string
-	opts Options
-	rev  rev // latest known etcd revision
+	url      string
+	opts     Options
+	inMemory bool // entirely in-memory
+
+	// rev is the latest known etcd revision.
+	// Must be accessed via atomic.LoadInt64/StoreInt64.
+	rev rev
 
 	done        <-chan struct{}
 	watchCancel func()
@@ -177,14 +181,24 @@ type KV struct {
 
 // New loads the contents of an etcd prefix range and creates a *DB
 // for reading and writing from the prefix range.
+//
+// The url value is the etcd JSON HTTP endpoint, e.g. "http://localhost:2379".
+//
+// As a special case, the url may be "memory://".
+// In this mode, the DB does not connect to any etcd server, instead all
+// operations are performed on the in-memory cache.
 func New(loadCtx context.Context, url string, opts Options) (*DB, error) {
 	db := &DB{
 		url:   url,
 		opts:  opts.fillDefaults(),
 		cache: make(map[string]kvrev),
 	}
-	if err := db.loadAll(loadCtx); err != nil {
-		return nil, fmt.Errorf("etcd.New: could not load: %w", err)
+	if db.url == "memory://" {
+		db.inMemory = true
+	} else {
+		if err := db.loadAll(loadCtx); err != nil {
+			return nil, fmt.Errorf("etcd.New: could not load: %w", err)
+		}
 	}
 
 	watchCtx, cancel := context.WithCancel(context.Background())
@@ -192,6 +206,9 @@ func New(loadCtx context.Context, url string, opts Options) (*DB, error) {
 	db.shutdownWG.Add(1)
 	go func() {
 		defer db.shutdownWG.Done()
+		if db.inMemory {
+			return
+		}
 		for {
 			if watchCtx.Err() != nil {
 				return
@@ -345,6 +362,10 @@ func (tx *Tx) Commit() error {
 		return nil
 	}
 
+	if tx.db.inMemory {
+		return tx.commitInMemory()
+	}
+
 	tx.db.shutdownWG.Add(1)
 	defer tx.db.shutdownWG.Done()
 	ctx, cancel := context.WithCancel(tx.ctx)
@@ -439,25 +460,33 @@ func (tx *Tx) Commit() error {
 		return ErrTxStale
 	}
 
+	tx.db.cacheMu.Lock()
+	defer tx.db.cacheMu.Unlock()
+	tx.commitCacheLocked(txnRes.Header.Revision)
+
+	return nil
+}
+
+// commitCacheLocked pushes the contents of tx into the DB cache.
+// db.cacheMu must be held to call.
+func (tx *Tx) commitCacheLocked(modRev rev) {
 	// Immediately load the new values into the cache.
 	// In theory the watch will fill in these values shortly, but
 	// doing it here has two advantages:
 	//	1. any Tx started immediately after this Tx will see the new
 	//	   values, avoiding "stale" reads in the API
 	//	2. it avoids significant JSON-decoding in the watch goroutine
-	tx.db.cacheMu.Lock()
-	defer tx.db.cacheMu.Unlock()
 	for key, val := range tx.puts {
 		kv, exists := tx.db.cache[key]
 		if exists {
-			if txnRes.Header.Revision <= kv.modRev {
+			if modRev <= kv.modRev {
 				delete(tx.puts, key)
 				continue
 			}
 		}
 		tx.db.cache[key] = kvrev{
 			value:  val,
-			modRev: txnRes.Header.Revision,
+			modRev: modRev,
 		}
 	}
 	if tx.db.opts.WatchFunc != nil && len(tx.puts) > 0 {
@@ -478,7 +507,27 @@ func (tx *Tx) Commit() error {
 		sort.Slice(kvs, func(i, j int) bool { return kvs[i].Key < kvs[j].Key })
 		tx.db.opts.WatchFunc(kvs)
 	}
+}
 
+func (tx *Tx) commitInMemory() error {
+	tx.db.cacheMu.Lock()
+	defer tx.db.cacheMu.Unlock()
+
+	// Check to make sure no other Tx beat us to the punch.
+	for key := range tx.puts {
+		kv, exists := tx.db.cache[key]
+		if !exists {
+			continue
+		}
+		if kv.modRev > tx.maxRev {
+			return ErrTxStale
+		}
+	}
+
+	modRev := rev(atomic.LoadInt64((*int64)(&tx.db.rev)))
+	modRev++
+	atomic.StoreInt64((*int64)(&tx.db.rev), int64(modRev))
+	tx.commitCacheLocked(modRev)
 	return nil
 }
 
