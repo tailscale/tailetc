@@ -51,9 +51,11 @@ func TestDB(t *testing.T) {
 		if err := tx.Commit(); err != nil {
 			t.Fatal(err)
 		}
-		//defer db.Close()
-		if gotk1, err := db.Tx(context.Background()).Get("/db/t2/k1"); err != nil {
+		var gotk1 T2
+		if found, err := db.Tx(context.Background()).Get("/db/t2/k1", &gotk1); err != nil {
 			t.Fatal(err)
+		} else if !found {
+			t.Errorf("/db/t2/k1 not found")
 		} else if gotk1 != k1 {
 			t.Errorf("/db/t2/k1=%v, want %v", gotk1, k1)
 		}
@@ -67,12 +69,15 @@ func TestDB(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer db.Close()
-		if gotk1, err := db.Tx(context.Background()).Get("/db/t2/k1"); err != nil {
+		var gotk1 T2
+		if found, err := db.Tx(context.Background()).Get("/db/t2/k1", &gotk1); err != nil {
 			t.Fatal(err)
+		} else if !found {
+			t.Errorf("/db/t2/k1 not found")
 		} else if gotk1 != k1 {
 			t.Errorf("/db/t2/k1=%v, want %v", gotk1, k1)
 		}
-		if gotk1, err := db.ReadTx().Get("/db/t2/k1"); err != nil {
+		if _, err := db.ReadTx().Get("/db/t2/k1", &gotk1); err != nil {
 			t.Fatal(err)
 		} else if gotk1 != k1 {
 			t.Errorf("/db/t2/k1=%v, want %v", gotk1, k1)
@@ -134,7 +139,7 @@ func testStaleTx(t *testing.T, url string) {
 		if err := tx.Commit(); err != nil {
 			t.Fatal(err)
 		}
-		checkWatch([]KV{{"/db/t2/k1", v1}})
+		checkWatch([]KV{{"/db/t2/k1", nil, v1}})
 		checkNoWatch()
 	}()
 
@@ -147,33 +152,34 @@ func testStaleTx(t *testing.T, url string) {
 		if err := tx.Commit(); err != nil {
 			t.Fatal(err)
 		}
-		checkWatch([]KV{{"/db/t2/k1", v1}})
+		checkWatch([]KV{{"/db/t2/k1", v1, v1}})
 		checkNoWatch()
 	}()
 
 	// update key
+	v2 := T2{F1: "f2", F2: true}
 	func() {
 		tx := db.Tx(ctx)
-		v2 := T2{F1: "f2", F2: true}
 		if err := tx.Put("/db/t2/k1", v2); err != nil {
 			t.Fatal(err)
 		}
 		if err := tx.Commit(); err != nil {
 			t.Fatal(err)
 		}
-		checkWatch([]KV{{"/db/t2/k1", v2}})
+		checkWatch([]KV{{"/db/t2/k1", v1, v2}})
 		checkNoWatch()
 	}()
 
 	// stale write
+	v3 := T2{F1: "f3", F2: true}
 	func() {
 		tx := db.Tx(ctx)
-		tx.Get("/db/t2/k1")
+		var gotk1 T2
+		tx.Get("/db/t2/k1", &gotk1)
 		if err := tx.Put("/db/t2/k1", T2{F1: "f4", F2: true}); err != nil {
 			t.Fatal(err)
 		}
 
-		v3 := T2{F1: "f3", F2: true}
 		tx2 := db.Tx(ctx)
 		if err := tx2.Put("/db/t2/k1", v3); err != nil {
 			t.Fatal(err)
@@ -181,7 +187,7 @@ func testStaleTx(t *testing.T, url string) {
 		if err := tx2.Commit(); err != nil {
 			t.Fatal(err)
 		}
-		checkWatch([]KV{{"/db/t2/k1", v3}})
+		checkWatch([]KV{{"/db/t2/k1", v2, v3}})
 		checkNoWatch()
 
 		if err := tx.Commit(); err == nil || !errors.Is(err, ErrTxStale) {
@@ -193,7 +199,8 @@ func testStaleTx(t *testing.T, url string) {
 	// stale read
 	func() {
 		tx := db.Tx(ctx)
-		if _, err := tx.Get("/db/t2/k1"); err != nil {
+		var gotk1 T2
+		if _, err := tx.Get("/db/t2/k1", &gotk1); err != nil {
 			t.Fatal(err)
 		}
 
@@ -205,9 +212,9 @@ func testStaleTx(t *testing.T, url string) {
 		if err := tx2.Commit(); err != nil {
 			t.Fatal(err)
 		}
-		checkWatch([]KV{{"/db/t2/k1", v3}})
+		checkWatch([]KV{{"/db/t2/k1", v3, v3}})
 
-		if _, err := tx.Get("/db/t2/k1"); err == nil || !errors.Is(err, ErrTxStale) {
+		if _, err := tx.Get("/db/t2/k1", &gotk1); err == nil || !errors.Is(err, ErrTxStale) {
 			t.Errorf("err=%v, want ErrTxStale", err)
 		}
 	}()
@@ -241,7 +248,8 @@ func testVariableKeys(t *testing.T, url string) {
 			var want []KV
 			for k := 0; k < j; k++ {
 				key := fmt.Sprintf("/db/t2/k%d", k)
-				want = append(want, KV{key, T2{F1: key, F2: true}})
+				val := T2{F1: key, F2: true}
+				want = append(want, KV{key, val, val})
 			}
 			tx := db.Tx(ctx)
 			for _, kv := range want {
@@ -255,7 +263,7 @@ func testVariableKeys(t *testing.T, url string) {
 
 			select {
 			case got := <-watchCh:
-				if !reflect.DeepEqual(got, want) {
+				if i > 0 && !reflect.DeepEqual(got, want) {
 					t.Errorf("i=%d, j=%d, Watch=%v, want %v", i, j, got, want)
 				}
 			case <-time.After(10 * time.Second):
@@ -299,7 +307,7 @@ func TestExternalValue(t *testing.T) {
 		t.Fatalf("etcdctl put failed: %v, stderr:\n%s", err, out)
 	}
 
-	want := []KV{{key, val}}
+	want := []KV{{key, nil, val}}
 
 	select {
 	case got := <-watchCh:
@@ -391,7 +399,7 @@ func testGetRange(t *testing.T, url string) {
 			t.Fatal(err)
 		}
 		sort.Slice(kvs, func(i, j int) bool { return kvs[i].Key < kvs[j].Key })
-		want := []KV{{"/a/1", []byte("1")}, {"/a/2", []byte("2")}, {"/a/3", []byte("3")}}
+		want := []KV{{"/a/1", nil, []byte("1")}, {"/a/2", nil, []byte("2")}, {"/a/3", nil, []byte("3")}}
 		if !reflect.DeepEqual(want, kvs) {
 			t.Errorf(`GetRange("/a/")=%v, want %v`, kvs, want)
 		}
@@ -403,7 +411,7 @@ func testGetRange(t *testing.T, url string) {
 			t.Fatal(err)
 		}
 		sort.Slice(kvs, func(i, j int) bool { return kvs[i].Key < kvs[j].Key })
-		want := []KV{{"/b/1", []byte("b1")}, {"/b/2", []byte("b2")}, {"/b/3", []byte("b3")}}
+		want := []KV{{"/b/1", nil, []byte("b1")}, {"/b/2", nil, []byte("b2")}, {"/b/3", nil, []byte("b3")}}
 		if !reflect.DeepEqual(want, kvs) {
 			t.Errorf(`GetRange("/b/")=%v, want %v`, kvs, want)
 		}
