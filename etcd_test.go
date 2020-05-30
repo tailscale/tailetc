@@ -18,9 +18,6 @@ import (
 	"time"
 )
 
-// TODO(crawshaw): remove this hacky use of systemd tmpfs when --unsafe-no-sync is released in etcd.
-var tmpDirRoot = os.Getenv("XDG_RUNTIME_DIR")
-
 var etcdURLVal string
 
 func etcdURL(tb testing.TB) string {
@@ -30,15 +27,65 @@ func etcdURL(tb testing.TB) string {
 	return etcdURLVal
 }
 
+// person is a database value test object used with the keys "/db/person/".
+type person struct {
+	ID            int    `json:"id"`
+	Name          string `json:"name"`
+	LikesIceCream bool   `json:"likes_ice_cream"`
+}
+
+var personOptions = Options{
+	KeyPrefix: "/db/",
+	EncodeFunc: func(key string, value interface{}) ([]byte, error) {
+		if value == nil {
+			return nil, nil
+		}
+		switch {
+		case strings.HasPrefix(key, "/db/person"):
+			return json.Marshal(value)
+		default:
+			b, isBytes := value.([]byte)
+			if isBytes {
+				return b, nil
+			}
+			return nil, fmt.Errorf("encodePerson: unknown value type %T", value)
+		}
+	},
+	DecodeFunc: func(key string, data []byte) (interface{}, error) {
+		switch {
+		case strings.HasPrefix(key, "/db/person"):
+			var p person
+			if err := json.Unmarshal(data, &p); err != nil {
+				return nil, err
+			}
+			return p, nil
+		default:
+			return data, nil
+		}
+	},
+	CloneFunc: func(dst interface{}, key string, value interface{}) error {
+		if value == nil {
+			return nil
+		}
+		switch {
+		case strings.HasPrefix(key, "/db/person"):
+			*dst.(*person) = value.(person)
+		default:
+			b := value.([]byte)
+			*dst.(*[]byte) = append([]byte(nil), b...)
+		}
+		return nil
+	},
+}
+
 func TestDB(t *testing.T) {
 	etcdDeleteAll(t)
 
 	ctx := context.Background()
-
-	k1 := T2{F1: "f1", F2: true}
+	alice := person{ID: 42, Name: "Alice", LikesIceCream: true}
 
 	t.Run("readwrite", func(t *testing.T) {
-		opts := optsTFunc
+		opts := personOptions
 		opts.Logf = t.Logf
 		db, err := New(ctx, etcdURL(t), opts)
 		if err != nil {
@@ -46,43 +93,68 @@ func TestDB(t *testing.T) {
 		}
 		defer db.Close()
 		tx := db.Tx(context.Background())
-		tx.Put("/db/t2/k1", k1)
-		tx.Put("/db/t2/k2", T2{F1: "f2", F2: true})
+		tx.Put("/db/person/alice", alice)
+		tx.Put("/db/person/bob", person{ID: 43, Name: "Bob"})
 		if err := tx.Commit(); err != nil {
 			t.Fatal(err)
 		}
-		var gotk1 T2
-		if found, err := db.Tx(context.Background()).Get("/db/t2/k1", &gotk1); err != nil {
+		var gotAlice person
+		if found, err := db.Tx(context.Background()).Get("/db/person/alice", &gotAlice); err != nil {
 			t.Fatal(err)
 		} else if !found {
-			t.Errorf("/db/t2/k1 not found")
-		} else if gotk1 != k1 {
-			t.Errorf("/db/t2/k1=%v, want %v", gotk1, k1)
+			t.Errorf("/db/person/alice not found")
+		} else if gotAlice != alice {
+			t.Errorf("/db/person/alice=%v, want %v", gotAlice, alice)
 		}
 	})
 
 	t.Run("readwrite-newdb", func(t *testing.T) {
-		opts := optsTFunc
+		opts := personOptions
 		opts.Logf = t.Logf
 		db, err := New(ctx, etcdURL(t), opts)
 		if err != nil {
 			t.Fatal(err)
 		}
 		defer db.Close()
-		var gotk1 T2
-		if found, err := db.Tx(context.Background()).Get("/db/t2/k1", &gotk1); err != nil {
+		var gotAlice person
+		if found, err := db.Tx(context.Background()).Get("/db/person/alice", &gotAlice); err != nil {
 			t.Fatal(err)
 		} else if !found {
-			t.Errorf("/db/t2/k1 not found")
-		} else if gotk1 != k1 {
-			t.Errorf("/db/t2/k1=%v, want %v", gotk1, k1)
+			t.Errorf("/db/person/alice not found")
+		} else if gotAlice != alice {
+			t.Errorf("/db/person/alice=%v, want %v", gotAlice, alice)
 		}
-		if _, err := db.ReadTx().Get("/db/t2/k1", &gotk1); err != nil {
+		if _, err := db.ReadTx().Get("/db/person/alice", &gotAlice); err != nil {
 			t.Fatal(err)
-		} else if gotk1 != k1 {
-			t.Errorf("/db/t2/k1=%v, want %v", gotk1, k1)
+		} else if gotAlice != alice {
+			t.Errorf("/db/person/alice=%v, want %v", gotAlice, alice)
 		}
 	})
+
+	t.Run("newline", func(t *testing.T) {
+		opts := personOptions
+		opts.Logf = t.Logf
+		db, err := New(ctx, etcdURL(t), opts)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer db.Close()
+		tx := db.Tx(ctx)
+		newline := person{Name: "line1\nline2"}
+		tx.Put("/db/person/newline", newline)
+		if err := tx.Commit(); err != nil {
+			t.Fatal(err)
+		}
+		tx = db.ReadTx()
+		var got person
+		if _, err := tx.Get("/db/person/newline", &got); err != nil {
+			t.Fatal(err)
+		}
+		if got != newline {
+			t.Errorf("/db/person/newline = %v, want %v", got, newline)
+		}
+	})
+
 }
 
 func TestStaleTx(t *testing.T) {
@@ -117,7 +189,7 @@ func testStaleTx(t *testing.T, url string) {
 	}
 
 	ctx := context.Background()
-	opts := optsTFunc
+	opts := personOptions
 	opts.Logf = t.Logf
 	opts.WatchFunc = func(kvs []KV) {
 		watchCh <- kvs
@@ -128,96 +200,84 @@ func testStaleTx(t *testing.T, url string) {
 	}
 	defer db.Close()
 
-	v1 := T2{F1: "f1", F2: true}
+	alice := person{ID: 42, Name: "Alice", LikesIceCream: true}
+	aliceNoIceCream := person{ID: 42, Name: "Alice", LikesIceCream: false}
 
 	// set key
-	func() {
-		tx := db.Tx(ctx)
-		if err := tx.Put("/db/t2/k1", v1); err != nil {
-			t.Fatal(err)
-		}
-		if err := tx.Commit(); err != nil {
-			t.Fatal(err)
-		}
-		checkWatch([]KV{{"/db/t2/k1", nil, v1}})
-		checkNoWatch()
-	}()
+	tx := db.Tx(ctx)
+	if err := tx.Put("/db/person/alice", alice); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	checkWatch([]KV{{"/db/person/alice", nil, alice}})
+	checkNoWatch()
 
 	// no-op replace key
-	func() {
-		tx := db.Tx(ctx)
-		if err := tx.Put("/db/t2/k1", v1); err != nil {
-			t.Fatal(err)
-		}
-		if err := tx.Commit(); err != nil {
-			t.Fatal(err)
-		}
-		checkWatch([]KV{{"/db/t2/k1", v1, v1}})
-		checkNoWatch()
-	}()
+	tx = db.Tx(ctx)
+	if err := tx.Put("/db/person/alice", alice); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	checkWatch([]KV{{"/db/person/alice", alice, alice}})
+	checkNoWatch()
 
 	// update key
-	v2 := T2{F1: "f2", F2: true}
-	func() {
-		tx := db.Tx(ctx)
-		if err := tx.Put("/db/t2/k1", v2); err != nil {
-			t.Fatal(err)
-		}
-		if err := tx.Commit(); err != nil {
-			t.Fatal(err)
-		}
-		checkWatch([]KV{{"/db/t2/k1", v1, v2}})
-		checkNoWatch()
-	}()
+	tx = db.Tx(ctx)
+	if err := tx.Put("/db/person/alice", aliceNoIceCream); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	checkWatch([]KV{{"/db/person/alice", alice, aliceNoIceCream}})
+	checkNoWatch()
 
 	// stale write
-	v3 := T2{F1: "f3", F2: true}
-	func() {
-		tx := db.Tx(ctx)
-		var gotk1 T2
-		tx.Get("/db/t2/k1", &gotk1)
-		if err := tx.Put("/db/t2/k1", T2{F1: "f4", F2: true}); err != nil {
-			t.Fatal(err)
-		}
+	tx = db.Tx(ctx)
+	var gotAlice person
+	tx.Get("/db/person/alice", &gotAlice)
+	if err := tx.Put("/db/person/alice", person{Name: "BadAliceTx"}); err != nil {
+		t.Fatal(err)
+	}
 
-		tx2 := db.Tx(ctx)
-		if err := tx2.Put("/db/t2/k1", v3); err != nil {
-			t.Fatal(err)
-		}
-		if err := tx2.Commit(); err != nil {
-			t.Fatal(err)
-		}
-		checkWatch([]KV{{"/db/t2/k1", v2, v3}})
-		checkNoWatch()
+	tx2 := db.Tx(ctx)
+	aliceNewID := person{ID: 4242, Name: "Alice", LikesIceCream: true}
+	if err := tx2.Put("/db/person/alice", aliceNewID); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx2.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	checkWatch([]KV{{"/db/person/alice", aliceNoIceCream, aliceNewID}})
+	checkNoWatch()
 
-		if err := tx.Commit(); err == nil || !errors.Is(err, ErrTxStale) {
-			t.Errorf("err=%v, want ErrTxStale", err)
-		}
-		checkNoWatch()
-	}()
+	if err := tx.Commit(); err == nil || !errors.Is(err, ErrTxStale) {
+		t.Errorf("err=%v, want ErrTxStale", err)
+	}
+	checkNoWatch()
 
 	// stale read
-	func() {
-		tx := db.Tx(ctx)
-		var gotk1 T2
-		if _, err := tx.Get("/db/t2/k1", &gotk1); err != nil {
-			t.Fatal(err)
-		}
+	tx = db.Tx(ctx)
+	if _, err := tx.Get("/db/person/alice", &gotAlice); err != nil {
+		t.Fatal(err)
+	}
 
-		v3 := T2{F1: "f3", F2: true}
-		tx2 := db.Tx(ctx)
-		if err := tx2.Put("/db/t2/k1", v3); err != nil {
-			t.Fatal(err)
-		}
-		if err := tx2.Commit(); err != nil {
-			t.Fatal(err)
-		}
-		checkWatch([]KV{{"/db/t2/k1", v3, v3}})
+	tx2 = db.Tx(ctx)
+	if err := tx2.Put("/db/person/alice", aliceNoIceCream); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx2.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	checkWatch([]KV{{"/db/person/alice", aliceNewID, aliceNoIceCream}})
 
-		if _, err := tx.Get("/db/t2/k1", &gotk1); err == nil || !errors.Is(err, ErrTxStale) {
-			t.Errorf("err=%v, want ErrTxStale", err)
-		}
-	}()
+	if _, err := tx.Get("/db/person/alice", &gotAlice); err == nil || !errors.Is(err, ErrTxStale) {
+		t.Errorf("err=%v, want ErrTxStale", err)
+	}
 }
 
 func TestVariableKeys(t *testing.T) {
@@ -232,7 +292,7 @@ func TestVariableKeysInMemory(t *testing.T) {
 func testVariableKeys(t *testing.T, url string) {
 	watchCh := make(chan []KV, 8)
 	ctx := context.Background()
-	opts := optsTFunc
+	opts := personOptions
 	opts.Logf = t.Logf
 	opts.WatchFunc = func(kvs []KV) {
 		watchCh <- kvs
@@ -247,8 +307,8 @@ func testVariableKeys(t *testing.T, url string) {
 		for j := 1; j < 5; j++ {
 			var want []KV
 			for k := 0; k < j; k++ {
-				key := fmt.Sprintf("/db/t2/k%d", k)
-				val := T2{F1: key, F2: true}
+				key := fmt.Sprintf("/db/person/k%d", k)
+				val := person{Name: key}
 				want = append(want, KV{key, val, val})
 			}
 			tx := db.Tx(ctx)
@@ -283,7 +343,7 @@ func TestExternalValue(t *testing.T) {
 
 	watchCh := make(chan []KV, 8)
 	ctx := context.Background()
-	opts := optsTFunc
+	opts := personOptions
 	opts.Logf = t.Logf
 	opts.WatchFunc = func(kvs []KV) {
 		watchCh <- kvs
@@ -294,8 +354,8 @@ func TestExternalValue(t *testing.T) {
 	}
 	defer db.Close()
 
-	key := "/db/t2/k1"
-	val := T2{F1: "cmdline"}
+	key := "/db/person/charlie"
+	val := person{Name: "Charlie"}
 
 	valBytes, err := json.Marshal(val)
 	if err != nil {
@@ -381,6 +441,7 @@ func testGetRange(t *testing.T, url string) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer db.Close()
 
 	tx := db.Tx(ctx)
 	tx.Put("/a/1", []byte("1"))
@@ -393,73 +454,44 @@ func testGetRange(t *testing.T, url string) {
 		t.Fatal(err)
 	}
 
-	func() {
-		var kvs []KV
-		if err := db.ReadTx().GetRange("/a/", func(k []KV) { kvs = append(kvs, k...) }); err != nil {
-			t.Fatal(err)
-		}
-		sort.Slice(kvs, func(i, j int) bool { return kvs[i].Key < kvs[j].Key })
-		want := []KV{{"/a/1", nil, []byte("1")}, {"/a/2", nil, []byte("2")}, {"/a/3", nil, []byte("3")}}
-		if !reflect.DeepEqual(want, kvs) {
-			t.Errorf(`GetRange("/a/")=%v, want %v`, kvs, want)
-		}
-	}()
-
-	func() {
-		var kvs []KV
-		if err := db.ReadTx().GetRange("/b/", func(k []KV) { kvs = append(kvs, k...) }); err != nil {
-			t.Fatal(err)
-		}
-		sort.Slice(kvs, func(i, j int) bool { return kvs[i].Key < kvs[j].Key })
-		want := []KV{{"/b/1", nil, []byte("b1")}, {"/b/2", nil, []byte("b2")}, {"/b/3", nil, []byte("b3")}}
-		if !reflect.DeepEqual(want, kvs) {
-			t.Errorf(`GetRange("/b/")=%v, want %v`, kvs, want)
-		}
-	}()
-}
-
-type T1 struct {
-	F1 string `json:"f1"`
-	I2 int    `json:"i1"`
-}
-
-type T2 struct {
-	F1 string `json:"f1"`
-	F2 bool   `json:"f2"`
-}
-
-var optsTFunc = Options{
-	KeyPrefix:  "/db/",
-	EncodeFunc: encodeTFunc,
-	DecodeFunc: decodeTFunc,
-}
-
-func encodeTFunc(key string, value interface{}) ([]byte, error) {
-	if value == nil {
-		return nil, nil
+	var kvs []KV
+	fn := func(k []KV) error {
+		kvs = append(kvs, k...)
+		return nil
 	}
-	switch {
-	case strings.HasPrefix(key, "/db/t2"):
-		return json.Marshal(value)
-	default:
-		b, isBytes := value.([]byte)
-		if isBytes {
-			return b, nil
-		}
-		return nil, fmt.Errorf("encodeTFunc: unknown value type %T", value)
+	if err := db.ReadTx().GetRange("/a/", fn); err != nil {
+		t.Fatal(err)
+	}
+	sort.Slice(kvs, func(i, j int) bool { return kvs[i].Key < kvs[j].Key })
+	want := []KV{{"/a/1", nil, []byte("1")}, {"/a/2", nil, []byte("2")}, {"/a/3", nil, []byte("3")}}
+	if !reflect.DeepEqual(want, kvs) {
+		t.Errorf(`GetRange("/a/")=%v, want %v`, kvs, want)
+	}
+
+	kvs = nil
+	if err := db.ReadTx().GetRange("/b/", fn); err != nil {
+		t.Fatal(err)
+	}
+	sort.Slice(kvs, func(i, j int) bool { return kvs[i].Key < kvs[j].Key })
+	want = []KV{{"/b/1", nil, []byte("b1")}, {"/b/2", nil, []byte("b2")}, {"/b/3", nil, []byte("b3")}}
+	if !reflect.DeepEqual(want, kvs) {
+		t.Errorf(`GetRange("/b/")=%v, want %v`, kvs, want)
 	}
 }
 
-func decodeTFunc(key string, data []byte) (interface{}, error) {
-	switch {
-	case strings.HasPrefix(key, "/db/t2"):
-		var t2 T2
-		if err := json.Unmarshal(data, &t2); err != nil {
-			return nil, err
+func TestAddOne(t *testing.T) {
+	tests := []struct{ key, res string }{
+		{"", ""},
+		{"/", "0"},
+		{"/db/", "/db0"},
+		{"/db/a", "/db/b"},
+		{"/db/\xff\xff", "/db0"},
+	}
+	for _, test := range tests {
+		got := string(addOne([]byte(test.key)))
+		if got != test.res {
+			t.Errorf("addOne(%q)=%q, want %q", test.key, got, test.res)
 		}
-		return t2, nil
-	default:
-		return data, nil
 	}
 }
 
@@ -467,7 +499,7 @@ func BenchmarkPutOver(b *testing.B) {
 	etcdDeleteAll(b)
 
 	ctx := context.Background()
-	opts := optsTFunc
+	opts := personOptions
 	opts.Logf = b.Logf
 	db, err := New(ctx, etcdURL(b), opts)
 	if err != nil {
@@ -475,10 +507,12 @@ func BenchmarkPutOver(b *testing.B) {
 	}
 	defer db.Close()
 
+	alice := person{ID: 42, Name: "Alice MacDuff", LikesIceCream: true}
+
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		tx := db.Tx(ctx)
-		tx.Put("/db/t2/k1", T1{F1: "a benchmark value", I2: i})
+		tx.Put("/db/person/alice", alice)
 		if err := tx.Commit(); err != nil {
 			b.Fatal(err)
 		}
@@ -489,7 +523,7 @@ func BenchmarkPut(b *testing.B) {
 	etcdDeleteAll(b)
 
 	ctx := context.Background()
-	opts := optsTFunc
+	opts := personOptions
 	opts.Logf = b.Logf
 	db, err := New(ctx, etcdURL(b), opts)
 	if err != nil {
@@ -497,10 +531,12 @@ func BenchmarkPut(b *testing.B) {
 	}
 	defer db.Close()
 
+	alice := person{ID: 42, Name: "Alice MacDuff", LikesIceCream: true}
+
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		tx := db.Tx(ctx)
-		tx.Put(fmt.Sprintf("/db/t2/k%d", i), T1{F1: "a benchmark value", I2: i})
+		tx.Put("/db/person/alice", alice)
 		if err := tx.Commit(); err != nil {
 			b.Fatal(err)
 		}
@@ -515,7 +551,7 @@ func benchmarkPutX(b *testing.B, x int) {
 	etcdDeleteAll(b)
 
 	ctx := context.Background()
-	opts := optsTFunc
+	opts := personOptions
 	opts.Logf = b.Logf
 	db, err := New(ctx, etcdURL(b), opts)
 	if err != nil {
@@ -540,7 +576,7 @@ func benchmarkPutX(b *testing.B, x int) {
 				limit <- struct{}{}
 			}()
 			tx := db.Tx(ctx)
-			tx.Put(fmt.Sprintf("/db/t2/k%d", i), T1{F1: "a benchmark value", I2: i})
+			tx.Put(fmt.Sprintf("/db/person/k%d", i), person{ID: i, LikesIceCream: true})
 			if err := tx.Commit(); err != nil {
 				errch <- err
 			}
@@ -582,7 +618,7 @@ func etcdDeleteAll(t testing.TB) {
 }
 
 func runEtcd() (clientURL string, cleanup func(), err error) {
-	tempDir, err := ioutil.TempDir(tmpDirRoot, "etcd-test-")
+	tempDir, err := ioutil.TempDir("", "etcd-test-")
 	if err != nil {
 		return "", nil, err
 	}
