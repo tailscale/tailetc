@@ -930,6 +930,15 @@ func (tx *Tx) get(key string) (bool, valueRev, error) {
 		return false, valueRev{}, tx.err
 	}
 
+	putValue, isPut := tx.puts[key]
+	if isPut {
+		v, err := tx.db.clone(key, putValue)
+		if err != nil {
+			return false, valueRev{}, err
+		}
+		return true, valueRev{value: v, modRev: tx.maxRev}, nil
+	}
+
 	tx.db.mu.RLock()
 	kv, ok := tx.db.cache[key]
 	if ok && tx.maxRev == 0 {

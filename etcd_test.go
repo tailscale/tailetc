@@ -94,10 +94,33 @@ func TestDB(t *testing.T) {
 		defer db.Close()
 		tx := db.Tx(context.Background())
 		tx.Put("/db/person/alice", alice)
+
+		// add bob
+		var gotBob person
+		if found, err := tx.Get("/db/person/bob", &gotBob); err != nil {
+			t.Fatal(err)
+		} else if found {
+			t.Errorf("expected no bob, got: %v", gotBob)
+		}
 		tx.Put("/db/person/bob", person{ID: 43, Name: "Bob"})
+		if found, err := tx.Get("/db/person/bob", &gotBob); err != nil {
+			t.Fatal(err)
+		} else if !found {
+			t.Errorf("could not get pending /db/person/bob entry")
+		}
+		tx.Put("/db/person/bob", person{ID: 43, Name: "Bob", LikesIceCream: true})
+		if found, err := tx.Get("/db/person/bob", &gotBob); err != nil {
+			t.Fatal(err)
+		} else if !found {
+			t.Errorf("could not get updated pending /db/person/bob entry")
+		} else if !gotBob.LikesIceCream {
+			t.Errorf("updated pending /db/person/bob entry LikesIceCream=false, want true")
+		}
+
 		if err := tx.Commit(); err != nil {
 			t.Fatal(err)
 		}
+
 		var gotAlice person
 		if found, err := db.Tx(context.Background()).Get("/db/person/alice", &gotAlice); err != nil {
 			t.Fatal(err)
