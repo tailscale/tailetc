@@ -299,6 +299,14 @@ func (db *DB) Close() error {
 //
 //	val, err := db.ReadTx().Get(key)
 type Tx struct {
+	// PendingUpdate, if not nil, is called on each Put.
+	// It can be used by higher-level objects to keep an index
+	// up-to-date on a transaction state.
+	//
+	// The memory passed to PendingUpdate are only valid for the
+	// duration of the call and must not be modified.
+	PendingUpdate func(key string, old, new interface{})
+
 	ctx context.Context
 	err error // if set, tx no longer usable
 	db  *DB
@@ -323,7 +331,7 @@ type Tx struct {
 
 // Get retrieves a key-value from the etcd cache into value.
 //
-// The value must be a pointer to the decoded type of the key.
+// The value must be a pointer to the decoded type of the key, or nil.
 // The caller owns the returned value.
 //
 // No network events are generated.
@@ -340,8 +348,10 @@ func (tx *Tx) Get(key string, value interface{}) (found bool, err error) {
 	if !found {
 		return false, nil
 	}
-	if err := tx.db.opts.CloneFunc(value, key, kv.value); err != nil {
-		return false, fmt.Errorf("etcd.Get(%q): %w", key, err)
+	if value != nil {
+		if err := tx.db.opts.CloneFunc(value, key, kv.value); err != nil {
+			return false, fmt.Errorf("etcd.Get(%q): %w", key, err)
+		}
 	}
 	return true, nil
 }
@@ -401,7 +411,8 @@ func (tx *Tx) Put(key string, value interface{}) error {
 		tx.err = fmt.Errorf("etcd.Put(%q) called on read-only transaction", key)
 		return tx.err
 	}
-	if _, _, err := tx.get(key); err != nil {
+	_, curVal, err := tx.get(key)
+	if err != nil {
 		return fmt.Errorf("etcd.Put(%q): %w", key, err)
 	}
 	if tx.puts == nil {
@@ -411,6 +422,9 @@ func (tx *Tx) Put(key string, value interface{}) error {
 	if err != nil {
 		tx.err = fmt.Errorf("etcd.Put(%q): %w", key, err)
 		return tx.err
+	}
+	if tx.PendingUpdate != nil {
+		tx.PendingUpdate(key, curVal.value, value)
 	}
 	tx.puts[key] = cloned
 	return nil

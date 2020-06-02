@@ -163,18 +163,46 @@ func TestDB(t *testing.T) {
 		}
 		defer db.Close()
 		tx := db.Tx(ctx)
-		newline := person{Name: "line1\nline2"}
-		tx.Put("/db/person/newline", newline)
+
+		newline1 := person{Name: "line1\n"}
+		newline2 := person{Name: "line1\nline2"}
+
+		const key = "/db/person/newline"
+		var pendingCalls int
+		var pendingErr error
+		tx.PendingUpdate = func(k string, old, new interface{}) {
+			if pendingErr != nil {
+				return
+			}
+			if k != key {
+				pendingErr = fmt.Errorf("PendingUpdate call %d: key=%q, want %q", pendingCalls, k, key)
+			}
+			v, _ := new.(person)
+			if pendingCalls == 0 && v.Name != newline1.Name {
+				pendingErr = fmt.Errorf("PendingUpdate call %d: Name=%q, want %q", pendingCalls, v.Name, newline1.Name)
+			}
+			if pendingCalls == 1 && v.Name != newline2.Name {
+				pendingErr = fmt.Errorf("PendingUpdate call %d: Name=%q, want %q", pendingCalls, v.Name, newline2.Name)
+			}
+			pendingCalls++
+		}
+
+		tx.Put(key, newline1)
+		tx.Put(key, newline2)
 		if err := tx.Commit(); err != nil {
 			t.Fatal(err)
 		}
 		tx = db.ReadTx()
 		var got person
-		if _, err := tx.Get("/db/person/newline", &got); err != nil {
+		if _, err := tx.Get(key, &got); err != nil {
 			t.Fatal(err)
 		}
-		if got != newline {
-			t.Errorf("/db/person/newline = %v, want %v", got, newline)
+		if got != newline2 {
+			t.Errorf("Get(%q) = %v, want %v", key, got, newline2)
+		}
+
+		if pendingErr != nil {
+			t.Error(pendingErr)
 		}
 	})
 
