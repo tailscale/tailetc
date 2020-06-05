@@ -107,7 +107,19 @@ type DB struct {
 	watchCancel func()
 	shutdownWG  sync.WaitGroup // shutdownWG.Add is called under mu when !closing
 
-	mu      sync.RWMutex
+	// Mu is the database lock.
+	//
+	// Reads are guarded by read locks.
+	// Transaction commits and background watch updates
+	// are guarded by write lcoks.
+	//
+	// The mutex is exported so that higher-level wrappers that want to
+	// keep indexes in sync with background updates without problematic
+	// lock ordering.
+	Mu sync.RWMutex
+
+	// The following fields are guarded by Mu.
+
 	cache   map[string]valueRev     // in-memory copy of all etcd key-values
 	rev     rev                     // rev is the latest known etcd db revision
 	closing bool                    // DB.Close called
@@ -142,6 +154,9 @@ type Options struct {
 	// When the update is a Tx from this DB, WatchFunc is called after
 	// the transaction has been successfully applied by the etcd server
 	// but before the Commit method returns.
+	//
+	// The DB.Mu write lock is held for the call, so no transcations
+	// can be issued from inside WatchFunc.
 	//
 	// Entire etcd transactions are single calls to WatchFunc.
 	//
@@ -277,10 +292,10 @@ func (db *DB) Tx(ctx context.Context) *Tx {
 
 // Close cancels all transactions and releases all DB resources.
 func (db *DB) Close() error {
-	db.mu.Lock()
+	db.Mu.Lock()
 	closing := db.closing
 	db.closing = true
-	db.mu.Unlock()
+	db.Mu.Unlock()
 
 	if closing {
 		return errors.New("etcd.DB: close already called")
@@ -371,8 +386,8 @@ func (tx *Tx) GetRange(keyPrefix string, fn func([]KV) error) (err error) {
 	// We can make this in-memory efficient by storing an ordered tree of keys,
 	// e.g. https://pkg.go.dev/github.com/dghubble/trie?tab=doc#PathTrie
 	// Or we can factor out the db.load method and use etcd's /range with keys_only=true.
-	tx.db.mu.RLock()
-	defer tx.db.mu.RUnlock()
+	tx.db.Mu.RLock()
+	defer tx.db.Mu.RUnlock()
 	for key := range tx.db.cache {
 		if !strings.HasPrefix(key, keyPrefix) {
 			continue
@@ -451,13 +466,13 @@ func (tx *Tx) Commit() error {
 		return tx.commitInMemory()
 	}
 
-	tx.db.mu.RLock()
+	tx.db.Mu.RLock()
 	if tx.db.closing {
-		tx.db.mu.RUnlock()
+		tx.db.Mu.RUnlock()
 		return ErrTxClosed
 	}
 	tx.db.shutdownWG.Add(1)
-	tx.db.mu.RUnlock()
+	tx.db.Mu.RUnlock()
 
 	defer tx.db.shutdownWG.Done()
 	ctx, cancel := context.WithCancel(tx.ctx)
@@ -562,13 +577,13 @@ func (tx *Tx) Commit() error {
 	txRev := txnRes.Header.Revision
 	var done chan struct{}
 
-	tx.db.mu.Lock()
+	tx.db.Mu.Lock()
 	tx.commitCacheLocked(txRev)
 	if tx.db.rev < txRev {
 		done = make(chan struct{})
 		tx.db.pending[txRev] = append(tx.db.pending[txRev], done)
 	}
-	tx.db.mu.Unlock()
+	tx.db.Mu.Unlock()
 
 	// Ensure the background watch has caught up to this commit, so that the
 	// db revision is at or beyond this commit. This means sequential
@@ -581,7 +596,7 @@ func (tx *Tx) Commit() error {
 }
 
 // commitCacheLocked pushes the contents of tx into the DB cache.
-// db.mu must be held to call.
+// db.Mu must be held to call.
 func (tx *Tx) commitCacheLocked(modRev rev) {
 	// Immediately load the new values into the cache.
 	// The watch will fill in these values shortly if it hasn't already
@@ -616,8 +631,8 @@ func (tx *Tx) commitCacheLocked(modRev rev) {
 }
 
 func (tx *Tx) commitInMemory() error {
-	tx.db.mu.Lock()
-	defer tx.db.mu.Unlock()
+	tx.db.Mu.Lock()
+	defer tx.db.Mu.Unlock()
 
 	// Check to make sure no other Tx beat us to the punch.
 	for key := range tx.puts {
@@ -666,9 +681,9 @@ func (db *DB) watch(ctx context.Context) error {
 	watchRequest.CreateRequest.Key = []byte(db.opts.KeyPrefix)
 	watchRequest.CreateRequest.RangeEnd = addOne([]byte(db.opts.KeyPrefix))
 
-	db.mu.RLock()
+	db.Mu.RLock()
 	watchRequest.CreateRequest.StartRevision = int64(db.rev)
-	db.mu.RUnlock()
+	db.Mu.RUnlock()
 
 	data, err := json.Marshal(watchRequest)
 	if err != nil {
@@ -738,9 +753,9 @@ func (db *DB) watchResult(data []byte) error {
 		// the value. This is a performance optimization, it's entirely possible
 		// the Tx commiting these values is still in-flight and will update the
 		// db.cache momentarily, so it is checked again below under the mutex.
-		db.mu.RLock()
+		db.Mu.RLock()
 		kv, exists := db.cache[key]
-		db.mu.RUnlock()
+		db.Mu.RUnlock()
 
 		if exists && ev.KV.ModRevision <= kv.modRev {
 			// We already have this value.
@@ -765,7 +780,7 @@ func (db *DB) watchResult(data []byte) error {
 		})
 	}
 
-	db.mu.Lock()
+	db.Mu.Lock()
 	var kvs []KV
 	for _, newkv := range newkvs {
 		kv, exists := db.cache[newkv.key]
@@ -795,7 +810,7 @@ func (db *DB) watchResult(data []byte) error {
 			delete(db.pending, rev)
 		}
 	}
-	db.mu.Unlock()
+	db.Mu.Unlock()
 
 	return nil
 }
@@ -816,8 +831,8 @@ func (db *DB) clone(key string, val interface{}) (interface{}, error) {
 // requesting keys at the revision we pinned the load at, so that all
 // changes that happen during the load are correctly played into DB.
 func (db *DB) loadAll(ctx context.Context) error {
-	db.mu.Lock()
-	defer db.mu.Unlock()
+	db.Mu.Lock()
+	defer db.Mu.Unlock()
 
 	startKey := []byte(db.opts.KeyPrefix)
 	endKey := addOne([]byte(db.opts.KeyPrefix))
@@ -953,12 +968,12 @@ func (tx *Tx) get(key string) (bool, valueRev, error) {
 		return true, valueRev{value: v, modRev: tx.maxRev}, nil
 	}
 
-	tx.db.mu.RLock()
+	tx.db.Mu.RLock()
 	kv, ok := tx.db.cache[key]
 	if ok && tx.maxRev == 0 {
 		tx.maxRev = tx.db.rev
 	}
-	tx.db.mu.RUnlock()
+	tx.db.Mu.RUnlock()
 
 	if !ok {
 		return false, valueRev{}, nil
