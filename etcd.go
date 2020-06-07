@@ -313,6 +313,9 @@ func (db *DB) Close() error {
 // A cheap etcd read can be done with:
 //
 //	val, err := db.ReadTx().Get(key)
+//
+// Tx is not safe for concurrent access.
+// For concurrency, create more transactions.
 type Tx struct {
 	// PendingUpdate, if not nil, is called on each Put.
 	// It can be used by higher-level objects to keep an index
@@ -322,8 +325,14 @@ type Tx struct {
 	// duration of the call and must not be modified.
 	PendingUpdate func(key string, old, new interface{})
 
+	// Err is any error reported by the transaction during use.
+	// This can be set used externally to ensure Commit does not fire.
+	//
+	// Once Err is set all future calls to Tx methods will return Err.
+	// On Commit, if Err is not set, it is set to ErrTxClosed
+	Err error
+
 	ctx context.Context
-	err error // if set, tx no longer usable
 	db  *DB
 	ro  bool // readonly
 
@@ -356,16 +365,26 @@ type Tx struct {
 // with a greater revision then get will return ErrTxStale.
 // This ensures that a Tx has a consistent view of the values it fetches.
 func (tx *Tx) Get(key string, value interface{}) (found bool, err error) {
+	if tx.Err != nil {
+		return false, tx.Err
+	}
+	defer func() {
+		if err != nil {
+			err = fmt.Errorf("etcd.Get(%q): %w", key, err)
+			tx.Err = err
+		}
+	}()
+
 	found, kv, err := tx.get(key)
 	if err != nil {
-		return false, fmt.Errorf("etcd.Get(%q): %w", key, err)
+		return false, err
 	}
 	if !found {
 		return false, nil
 	}
 	if value != nil {
 		if err := tx.db.opts.CloneFunc(value, key, kv.value); err != nil {
-			return false, fmt.Errorf("etcd.Get(%q): %w", key, err)
+			return false, err
 		}
 	}
 	return true, nil
@@ -380,6 +399,18 @@ func (tx *Tx) Get(key string, value interface{}) (found bool, err error) {
 // For the duration of the GetRange call a DB-wide lock is held,
 // so no transactions can be committed from inside the fn callback.
 func (tx *Tx) GetRange(keyPrefix string, fn func([]KV) error) (err error) {
+	if tx.Err != nil {
+		return tx.Err
+	}
+	defer func() {
+		if err != nil {
+			err = fmt.Errorf("etcd.GetRange(%q): %w", keyPrefix, err)
+			if tx.Err == nil {
+				tx.Err = err
+			}
+		}
+	}()
+
 	var kvs []KV
 
 	// TODO(crawshaw): This is an inefficient O(N) implementation.
@@ -394,13 +425,13 @@ func (tx *Tx) GetRange(keyPrefix string, fn func([]KV) error) (err error) {
 		}
 		found, kv, err := tx.get(key)
 		if err != nil {
-			return fmt.Errorf("etcd.GetRange(%q): %s: %w", keyPrefix, key, err)
+			return fmt.Errorf("%s: %w", key, err)
 		} else if !found {
-			return fmt.Errorf("etcd.GetRange(%q): %s: cannot find expected key", keyPrefix, key)
+			return fmt.Errorf("%s: cannot find expected key", key)
 		}
 		cloned, err := tx.db.clone(key, kv.value)
 		if err != nil {
-			return fmt.Errorf("etcd.GetRange(%q): clone %s: %w", keyPrefix, key, err)
+			return fmt.Errorf("clone %s: %w", key, err)
 		}
 		kvs = append(kvs, KV{Key: key, Value: cloned})
 		if len(kvs) > 100 {
@@ -423,20 +454,27 @@ func (tx *Tx) GetRange(keyPrefix string, fn func([]KV) error) (err error) {
 // If a newer value for the key is in the DB this will return ErrTxStale.
 func (tx *Tx) Put(key string, value interface{}) error {
 	if tx.ro {
-		tx.err = fmt.Errorf("etcd.Put(%q) called on read-only transaction", key)
-		return tx.err
+		err := fmt.Errorf("etcd.Put(%q) called on read-only transaction", key)
+		if tx.Err == nil {
+			tx.Err = err
+		}
+		return err
+	}
+	if tx.Err != nil {
+		return tx.Err
 	}
 	_, curVal, err := tx.get(key)
 	if err != nil {
-		return fmt.Errorf("etcd.Put(%q): %w", key, err)
+		tx.Err = fmt.Errorf("etcd.Put(%q): %w", key, err)
+		return tx.Err
 	}
 	if tx.puts == nil {
 		tx.puts = make(map[string]interface{})
 	}
 	cloned, err := tx.db.clone(key, value)
 	if err != nil {
-		tx.err = fmt.Errorf("etcd.Put(%q): %w", key, err)
-		return tx.err
+		tx.Err = fmt.Errorf("etcd.Put(%q): %w", key, err)
+		return tx.Err
 	}
 	if tx.PendingUpdate != nil {
 		tx.PendingUpdate(key, curVal.value, value)
@@ -447,17 +485,25 @@ func (tx *Tx) Put(key string, value interface{}) error {
 
 // Commit commits the transaction to etcd.
 // It is an error to call Commit on a read-only transaction.
-func (tx *Tx) Commit() error {
-	if tx.err != nil {
-		return fmt.Errorf("etcd.Commit: %w", tx.err)
-	}
-	if tx.ro {
-		tx.err = fmt.Errorf("tx is read-only")
-		return fmt.Errorf("etcd.Commit: %w", tx.err)
+func (tx *Tx) Commit() (err error) {
+	if tx.Err != nil {
+		return fmt.Errorf("etcd.Commit: %w", tx.Err)
 	}
 	defer func() {
-		tx.err = ErrTxClosed
+		if err != nil {
+			err = fmt.Errorf("etcd.Commit: %w", err)
+		}
+		if tx.Err == nil {
+			if err != nil {
+				tx.Err = err
+			} else {
+				tx.Err = ErrTxClosed
+			}
+		}
 	}()
+	if tx.ro {
+		return errors.New("tx is read-only")
+	}
 	if len(tx.puts) == 0 {
 		return nil
 	}
@@ -527,7 +573,7 @@ func (tx *Tx) Commit() error {
 	for key, val := range tx.puts {
 		data, err := tx.db.opts.EncodeFunc(key, val)
 		if err != nil {
-			return fmt.Errorf("etcd.Commit: EncodeFunc failed for key %q: %v", key, err)
+			return fmt.Errorf("EncodeFunc failed for key %q: %v", key, err)
 		}
 
 		var s txnSuccess
@@ -537,12 +583,12 @@ func (tx *Tx) Commit() error {
 	}
 	data, err := json.Marshal(txnReq)
 	if err != nil {
-		return fmt.Errorf("etcd.Commit: %w", err)
+		return err
 	}
 
 	req, err := http.NewRequest("POST", tx.db.url+"/v3/kv/txn", bytes.NewReader(data))
 	if err != nil {
-		return fmt.Errorf("etcd.Commit: %w", err)
+		return err
 	}
 	if tx.db.opts.AuthHeader != "" {
 		req.Header.Set("Authorization", tx.db.opts.AuthHeader)
@@ -550,12 +596,12 @@ func (tx *Tx) Commit() error {
 	req = req.WithContext(ctx)
 	res, err := tx.db.opts.HTTPC.Do(req)
 	if err != nil {
-		return fmt.Errorf("etcd.Commit: %w", err)
+		return err
 	}
 	defer res.Body.Close()
 	if res.StatusCode != 200 {
 		b, _ := ioutil.ReadAll(res.Body)
-		return fmt.Errorf("etcd.Commit: status=%d: %q", res.StatusCode, string(b))
+		return fmt.Errorf("status=%d: %q", res.StatusCode, string(b))
 	}
 	var txnRes struct { // message TxnResponse
 		Header struct {
@@ -565,12 +611,19 @@ func (tx *Tx) Commit() error {
 	}
 	b, err := ioutil.ReadAll(res.Body)
 	if err != nil {
-		return fmt.Errorf("etcd.Commit: read response: %w: %s", err, b)
+		return fmt.Errorf("read response: %w: %s", err, b)
 	}
 	if err := json.NewDecoder(bytes.NewReader(b)).Decode(&txnRes); err != nil {
-		return fmt.Errorf("etcd.Commit: decode response: %w: %v", err, b)
+		return fmt.Errorf("decode response: %w: %v", err, b)
 	}
 	if !txnRes.Succeeded {
+		if len(tx.puts) == 1 {
+			var key string
+			for k := range tx.puts {
+				key = k
+			}
+			return fmt.Errorf("%w: key %s", ErrTxStale, key)
+		}
 		return ErrTxStale
 	}
 
@@ -641,7 +694,7 @@ func (tx *Tx) commitInMemory() error {
 			continue
 		}
 		if kv.modRev > tx.maxRev {
-			return ErrTxStale
+			return fmt.Errorf("%w: key %s", ErrTxStale, key)
 		}
 	}
 
@@ -954,9 +1007,6 @@ func addOne(v []byte) []byte {
 func (tx *Tx) get(key string) (bool, valueRev, error) {
 	if !strings.HasPrefix(key, tx.db.opts.KeyPrefix) {
 		return false, valueRev{}, fmt.Errorf("key does not use prefix %s", tx.db.opts.KeyPrefix)
-	}
-	if tx.err != nil {
-		return false, valueRev{}, tx.err
 	}
 
 	putValue, isPut := tx.puts[key]
