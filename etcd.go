@@ -312,7 +312,7 @@ func (db *DB) Close() error {
 // no notion of closing a transaction or rolling back a transaction.
 // A cheap etcd read can be done with:
 //
-//	val, err := db.ReadTx().Get(key)
+//	found, err := db.ReadTx().Get(key, &val)
 //
 // Tx is not safe for concurrent access.
 // For concurrency, create more transactions.
