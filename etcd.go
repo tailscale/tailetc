@@ -900,12 +900,37 @@ func (db *DB) loadAll(ctx context.Context) error {
 	db.Mu.Lock()
 	defer db.Mu.Unlock()
 
+	// loadPageLimit is the maximum number of records returned by a
+	// /range request.
+	//
+	// By default etcd is configured with a maximum message size and
+	// if you request more keys than that it returns an HTTP status
+	// 429 error:
+	//
+	//	{"error":"grpc: received message larger than max (16761782 vs. 4194304)","code":8}
+	//
+	// To avoid this we set a limit on the number of keys we request.
+	// It may be too big. So we look for the error message and shrink
+	// the limit until the request succeeds.
+	loadPageLimit := initLoadPageLimit
+
 	startKey := []byte(db.opts.KeyPrefix)
 	endKey := addOne([]byte(db.opts.KeyPrefix))
 	var maxModRev rev
 	for len(startKey) > 0 {
-		nextKey, dbRev, err := db.load(ctx, startKey, endKey, maxModRev)
+		keyRange := etcdRangeRequest{
+			Key:            startKey,
+			RangeEnd:       endKey,
+			Limit:          loadPageLimit,
+			MaxModRevision: maxModRev,
+		}
+		nextKey, dbRev, err := db.load(ctx, keyRange)
 		if err != nil {
+			if errors.Is(err, errReqTooBig) && loadPageLimit > 128 {
+				db.opts.Logf("etcd.New: load range of %d keys too big, trying fewer", loadPageLimit)
+				loadPageLimit /= 2
+				continue
+			}
 			return err
 		}
 		if maxModRev == 0 {
@@ -917,7 +942,17 @@ func (db *DB) loadAll(ctx context.Context) error {
 	return nil
 }
 
-const loadPageLimit = 100
+var initLoadPageLimit = 1 << 14 // variable for testing
+
+var errReqTooBig = errors.New("req too big, make it smaller")
+
+// etcdRangeRequest is a JSON representation of the proto message RangeRequest.
+type etcdRangeRequest struct {
+	Key            []byte `json:"key"`
+	RangeEnd       []byte `json:"range_end,omitempty"`
+	Limit          int    `json:"limit,omitempty"`
+	MaxModRevision rev    `json:"max_mod_revision,omitempty"`
+}
 
 // load issues a range request against etcd for the range startKey-endKey
 // and processes up to loadPageLimit keys.
@@ -928,17 +963,7 @@ const loadPageLimit = 100
 //
 // When load returns it reports the next key in the cursor and the db
 // revision the range request was issued at.
-func (db *DB) load(ctx context.Context, startKey, endKey []byte, maxModRev rev) (nextKey []byte, dbRev rev, err error) {
-	var keyRange struct {
-		Key            []byte `json:"key"`
-		RangeEnd       []byte `json:"range_end,omitempty"`
-		Limit          int    `json:"limit,omitempty"`
-		MaxModRevision int64  `json:"max_mod_revision,omitempty"`
-	}
-	keyRange.Key = startKey
-	keyRange.RangeEnd = endKey
-	keyRange.Limit = loadPageLimit
-	keyRange.MaxModRevision = int64(maxModRev)
+func (db *DB) load(ctx context.Context, keyRange etcdRangeRequest) (nextKey []byte, dbRev rev, err error) {
 	keyRangeData, err := json.Marshal(keyRange)
 	if err != nil {
 		return nil, 0, err
@@ -958,7 +983,23 @@ func (db *DB) load(ctx context.Context, startKey, endKey []byte, maxModRev rev) 
 	defer res.Body.Close()
 	if res.StatusCode != 200 {
 		b, _ := ioutil.ReadAll(res.Body)
-		return nil, 0, fmt.Errorf("etcd.New: key range status=%d: %q", res.StatusCode, string(b))
+		const (
+			grpcOK                = 0
+			grpcResourceExhausted = 8
+		)
+		var errMsg struct {
+			Error string `json:"error"`
+			// Code is the gRPC status response code.
+			// https://developers.google.com/maps-booking/reference/grpc-api/status_codes
+			Code int `json:"code"`
+		}
+		if err := json.Unmarshal(b, &errMsg); err == nil && errMsg.Code != grpcOK {
+			if res.StatusCode == 429 && errMsg.Code == 8 {
+				return nil, 0, fmt.Errorf("%w: %s", errReqTooBig, errMsg.Error)
+			}
+			return nil, 0, fmt.Errorf("/range code=%d/%d: %s", res.StatusCode, errMsg.Code, errMsg.Error)
+		}
+		return nil, 0, fmt.Errorf("key range status=%d: %q", res.StatusCode, string(b))
 	}
 
 	var rangeResponse struct {

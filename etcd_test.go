@@ -438,6 +438,12 @@ func TestLoadPageLimit(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	origLoadPageLimit := initLoadPageLimit
+	initLoadPageLimit = 100
+	defer func() {
+		initLoadPageLimit = origLoadPageLimit
+	}()
+
 	tx := db.Tx(ctx)
 	tx.Put("/a1", []byte("first"))
 	if err := tx.Commit(); err != nil {
@@ -445,7 +451,7 @@ func TestLoadPageLimit(t *testing.T) {
 	}
 
 	tx = db.Tx(ctx)
-	for i := 0; i < loadPageLimit; i++ {
+	for i := 0; i < initLoadPageLimit; i++ {
 		tx.Put(fmt.Sprintf("/b%d", i), []byte("second"))
 	}
 	if err := tx.Commit(); err != nil {
@@ -453,7 +459,7 @@ func TestLoadPageLimit(t *testing.T) {
 	}
 
 	tx = db.Tx(ctx)
-	for i := 0; i < loadPageLimit; i++ {
+	for i := 0; i < initLoadPageLimit; i++ {
 		tx.Put(fmt.Sprintf("/c%d", i), []byte("second"))
 	}
 	if err := tx.Commit(); err != nil {
