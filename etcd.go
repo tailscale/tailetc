@@ -1085,10 +1085,12 @@ func (tx *Tx) get(key string) (bool, valueRev, error) {
 	if tx.maxRev < kv.modRev {
 		return false, valueRev{}, ErrTxStale
 	}
-	if tx.cmps == nil {
-		tx.cmps = make(map[string]struct{})
+	if !tx.ro {
+		if tx.cmps == nil {
+			tx.cmps = make(map[string]struct{})
+		}
+		tx.cmps[key] = struct{}{}
 	}
-	tx.cmps[key] = struct{}{}
 	return true, kv, nil
 }
 
