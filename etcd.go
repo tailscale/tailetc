@@ -396,49 +396,77 @@ func (tx *Tx) Get(key string, value interface{}) (found bool, err error) {
 // The passed slice and all the memory it references is owned by fn.
 // If fn returns an error then GetRange aborts early and returns the error.
 //
-// For the duration of the GetRange call a DB-wide lock is held,
+// While fn is called GetRange holds either the DB read or write lock,
 // so no transactions can be committed from inside the fn callback.
-func (tx *Tx) GetRange(keyPrefix string, fn func([]KV) error) (err error) {
-	if tx.Err != nil {
-		return tx.Err
-	}
+//
+// It is possible for the same key to be sent to fn more than once in a
+// GetRange call. If this happens, the later key-value pair is a newer
+// version that replaces the old value.
+//
+// When all keys have been read, finalFn is called holding the DB write lock.
+// This gives the caller a chance to do something knowing that no key updates
+// can happen between reading the range and executing finalFn.
+func (db *DB) GetRange(keyPrefix string, fn func([]KV) error, finalFn func()) (err error) {
 	defer func() {
 		if err != nil {
 			err = fmt.Errorf("etcd.GetRange(%q): %w", keyPrefix, err)
-			if tx.Err == nil {
-				tx.Err = err
-			}
 		}
 	}()
 
+	// First take a read lock and send all relevant KV-pairs to fn.
+	// This should include alomst all of the KV-space.
+	db.Mu.RLock()
+	revDone := db.rev
+	err = db.getRange(keyPrefix, fn, 0)
+	db.Mu.RUnlock()
+
+	if err != nil {
+		return err
+	}
+
+	// Now grab a write lock. Find all KV-pairs that have changed since
+	// we held the read lock and send those to fn.
+	//
+	// The double pass is to minimize the time GetRange holds the write lock.
+	db.Mu.Lock()
+	err = db.getRange(keyPrefix, fn, revDone+1)
+	if err == nil && finalFn != nil {
+		finalFn()
+	}
+	db.Mu.Unlock()
+
+	return err
+}
+
+// getRange gets all key-values with keyPrefix and passes them to fn.
+//
+// The DB read lock must be held for the duration of the call.
+//
+// TODO(crawshaw): This is an inefficient O(N) implementation.
+// We can make this in-memory efficient by storing an ordered tree of keys,
+// e.g. https://pkg.go.dev/github.com/dghubble/trie?tab=doc#PathTrie
+// Or we can factor out the db.load method and use etcd's /range with keys_only=true.
+func (db *DB) getRange(keyPrefix string, fn func([]KV) error, min rev) error {
+	const window = 256
 	var kvs []KV
 
-	// TODO(crawshaw): This is an inefficient O(N) implementation.
-	// We can make this in-memory efficient by storing an ordered tree of keys,
-	// e.g. https://pkg.go.dev/github.com/dghubble/trie?tab=doc#PathTrie
-	// Or we can factor out the db.load method and use etcd's /range with keys_only=true.
-	tx.db.Mu.RLock()
-	defer tx.db.Mu.RUnlock()
-	for key := range tx.db.cache {
+	for key, kv := range db.cache {
 		if !strings.HasPrefix(key, keyPrefix) {
 			continue
 		}
-		found, kv, err := tx.get(key)
-		if err != nil {
-			return fmt.Errorf("%s: %w", key, err)
-		} else if !found {
-			return fmt.Errorf("%s: cannot find expected key", key)
+		if kv.modRev < min {
+			continue
 		}
-		cloned, err := tx.db.clone(key, kv.value)
+		cloned, err := db.clone(key, kv.value)
 		if err != nil {
 			return fmt.Errorf("clone %s: %w", key, err)
 		}
 		kvs = append(kvs, KV{Key: key, Value: cloned})
-		if len(kvs) > 100 {
+		if len(kvs) > window {
 			if err := fn(kvs); err != nil {
 				return err
 			}
-			kvs = nil
+			kvs = nil // passing ownership of kvs to fn
 		}
 	}
 	if len(kvs) > 0 {
@@ -447,7 +475,7 @@ func (tx *Tx) GetRange(keyPrefix string, fn func([]KV) error) (err error) {
 		}
 		kvs = nil // passing ownership of kvs to fn
 	}
-	return err
+	return nil
 }
 
 // Put adds or replaces a KV-pair in the transaction.

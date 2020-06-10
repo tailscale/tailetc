@@ -516,7 +516,7 @@ func testGetRange(t *testing.T, url string) {
 		kvs = append(kvs, k...)
 		return nil
 	}
-	if err := db.ReadTx().GetRange("/a/", fn); err != nil {
+	if err := db.GetRange("/a/", fn, nil); err != nil {
 		t.Fatal(err)
 	}
 	sort.Slice(kvs, func(i, j int) bool { return kvs[i].Key < kvs[j].Key })
@@ -526,7 +526,7 @@ func testGetRange(t *testing.T, url string) {
 	}
 
 	kvs = nil
-	if err := db.ReadTx().GetRange("/b/", fn); err != nil {
+	if err := db.GetRange("/b/", fn, nil); err != nil {
 		t.Fatal(err)
 	}
 	sort.Slice(kvs, func(i, j int) bool { return kvs[i].Key < kvs[j].Key })
