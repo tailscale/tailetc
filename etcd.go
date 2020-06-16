@@ -601,7 +601,20 @@ func (tx *Tx) Commit() (err error) {
 	defer res.Body.Close()
 	if res.StatusCode != 200 {
 		b, _ := ioutil.ReadAll(res.Body)
-		return fmt.Errorf("status=%d: %q", res.StatusCode, string(b))
+		str := string(b)
+		if res.StatusCode == 400 && strings.Contains(str, "too many operations") {
+			builder := new(strings.Builder)
+			fmt.Fprintf(builder, "cmps (%d):", len(tx.cmps))
+			for key := range tx.cmps {
+				fmt.Fprintf(builder, "\n\t%s", key)
+			}
+			fmt.Fprintf(builder, "\nputs (%d):", len(tx.puts))
+			for _, s := range txnReq.Success {
+				fmt.Fprintf(builder, "\n\t%s: %s", s.RequestPut.Key, s.RequestPut.Value)
+			}
+			return fmt.Errorf("too many operations: %s", builder)
+		}
+		return fmt.Errorf("status=%d: %q", res.StatusCode, str)
 	}
 	var txnRes struct { // message TxnResponse
 		Header struct {
