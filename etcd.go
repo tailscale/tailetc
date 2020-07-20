@@ -1104,6 +1104,10 @@ func (tx *Tx) get(key string) (bool, valueRev, error) {
 	kv, ok := tx.db.cache[key]
 	if ok && tx.maxRev == 0 {
 		tx.maxRev = tx.db.rev
+		if kv.modRev > tx.maxRev {
+			tx.db.Mu.RUnlock()
+			panic(fmt.Sprintf("on new tx kv.modRev %d > tx.maxRev %d", kv.modRev, tx.maxRev))
+		}
 	}
 	tx.db.Mu.RUnlock()
 
