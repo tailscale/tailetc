@@ -584,8 +584,8 @@ func (tx *Tx) Commit() (err error) {
 		} `json:"requestPut"`
 	}
 	var txnReq struct { // message TxnRequest
-		Compare []txnCompare `json:"compare"` // conditions
-		Success []txnSuccess `json:"success"` // actions if conditions met
+		Compare []txnCompare `json:"compare,omitempty"` // conditions
+		Success []txnSuccess `json:"success"`           // actions if conditions met
 	}
 	for key := range tx.cmps {
 		// Here we set the required mod revision of every key
@@ -837,11 +837,13 @@ func (db *DB) watch(ctx context.Context) error {
 // watchResult processes a JSON blob from the etcd watch API.
 func (db *DB) watchResult(data []byte) error {
 	var watchResult struct {
-		Result struct {
-			Header struct {
+		Result struct { // message WatchResponse
+			Header struct { // message ResponseHeader
 				Revision rev `json:"revision"`
 			} `json:"header"`
-			Events []struct {
+			Created  bool `json:"created"`
+			Fragment bool `json:"fragment"`
+			Events   []struct {
 				Type string `json:"type"`
 				KV   struct {
 					Key         []byte `json:"key"`
@@ -853,6 +855,16 @@ func (db *DB) watchResult(data []byte) error {
 	}
 	if err := json.Unmarshal(data, &watchResult); err != nil {
 		return err
+	}
+
+	if watchResult.Result.Created {
+		// Note that created=true can be sent with a header revision
+		// that will be repeated in a subsequent watch result message
+		// including events, so we must not increment db.rev here.
+		if len(watchResult.Result.Events) > 0 {
+			panic("watch creation message contains events: " + string(data))
+		}
+		return nil
 	}
 
 	type newkv struct {
@@ -916,13 +928,15 @@ func (db *DB) watchResult(data []byte) error {
 		sort.Slice(kvs, func(i, j int) bool { return kvs[i].Key < kvs[j].Key })
 		db.opts.WatchFunc(kvs)
 	}
-	db.rev = rev(watchResult.Result.Header.Revision)
-	for rev, doneChs := range db.pending {
-		if rev <= db.rev {
-			for _, done := range doneChs {
-				close(done)
+	if !watchResult.Result.Fragment {
+		db.rev = rev(watchResult.Result.Header.Revision)
+		for rev, doneChs := range db.pending {
+			if rev <= db.rev {
+				for _, done := range doneChs {
+					close(done)
+				}
+				delete(db.pending, rev)
 			}
-			delete(db.pending, rev)
 		}
 	}
 	db.Mu.Unlock()
