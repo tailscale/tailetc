@@ -672,7 +672,28 @@ func (tx *Tx) Commit() (err error) {
 	var done chan struct{}
 
 	tx.db.Mu.Lock()
-	tx.commitCacheLocked(txRev)
+	// TODO(crawshaw): a potential optimization here is to put our
+	// unaliased, ready to use value objects directly into the cache,
+	// saving an encode/decode round-trip to the database.
+	//
+	// However there is one significant hurdle: once we put the rev
+	// into the cache, we must increment tx.db.rev or a new Tx that
+	// attempts to read the value will immediately fail with ErrTxStale.
+	// But we cannot increment db.rev yet, as there may commits created
+	// by other clients pending in the server that will come in later.
+	//
+	// So instead we must put the objects aside in a limbo, and add
+	// them to the db.cache in watchResult. We must do this especially
+	// carefully, as etcd may have chosen to amalgamate our commit with
+	// some other client's commit, so the incoming txRev may include
+	// more objects than we committed here. Either way, it is unsafe
+	// to simply call:
+	//
+	// tx.commitCacheLocked(txRev)
+	//
+	// This optimization is significant and we should do it.
+	// It should be easy enough to add a db.pendingCache and extract
+	// the values from it in watchResult.
 	if tx.db.rev < txRev {
 		done = make(chan struct{})
 		tx.db.pending[txRev] = append(tx.db.pending[txRev], done)
