@@ -822,7 +822,10 @@ func (db *DB) watch(ctx context.Context) error {
 		return fmt.Errorf("status=%d: %q", res.StatusCode, string(b))
 	}
 
+	// TODO(crawshaw): can we query the maximum size from etcd?
+	const fiveMB = 5 << 20
 	scanner := bufio.NewScanner(res.Body)
+	scanner.Buffer(nil, fiveMB)
 	for scanner.Scan() {
 		if err := db.watchResult(scanner.Bytes()); err != nil {
 			return err
