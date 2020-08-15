@@ -1008,7 +1008,7 @@ func (db *DB) loadAll(ctx context.Context) error {
 	return nil
 }
 
-var initLoadPageLimit = 1 << 14 // variable for testing
+var initLoadPageLimit = 4096 // variable for testing
 
 var errReqTooBig = errors.New("req too big, make it smaller")
 
