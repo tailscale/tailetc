@@ -228,7 +228,7 @@ func New(ctx context.Context, url string, opts Options) (*DB, error) {
 		db.inMemory = true
 	} else {
 		var err error
-		db.cli, err = clientv3.NewFromURL(url)
+		db.cli, err = clientv3.New(clientv3.Config{Endpoints: []string{url}})
 		if err != nil {
 			return nil, fmt.Errorf("etcd.New: %v", err)
 		}
@@ -283,6 +283,10 @@ func (db *DB) Close() error {
 
 	db.watchCancel()
 	db.shutdownWG.Wait()
+
+	if db.cli != nil {
+		return db.cli.Close()
+	}
 	return nil
 }
 
