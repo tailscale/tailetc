@@ -430,59 +430,6 @@ func TestExternalValue(t *testing.T) {
 	}
 }
 
-func TestLoadPageLimit(t *testing.T) {
-	etcdDeleteAll(t)
-	ctx := context.Background()
-	db, err := New(ctx, etcdURL(t), Options{Logf: t.Logf})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	origLoadPageLimit := initLoadPageLimit
-	initLoadPageLimit = 100
-	defer func() {
-		initLoadPageLimit = origLoadPageLimit
-	}()
-
-	tx := db.Tx(ctx)
-	tx.Put("/a1", []byte("first"))
-	if err := tx.Commit(); err != nil {
-		t.Fatal(err)
-	}
-
-	tx = db.Tx(ctx)
-	for i := 0; i < initLoadPageLimit; i++ {
-		tx.Put(fmt.Sprintf("/b%d", i), []byte("second"))
-	}
-	if err := tx.Commit(); err != nil {
-		t.Fatal(err)
-	}
-
-	tx = db.Tx(ctx)
-	for i := 0; i < initLoadPageLimit; i++ {
-		tx.Put(fmt.Sprintf("/c%d", i), []byte("second"))
-	}
-	if err := tx.Commit(); err != nil {
-		t.Fatal(err)
-	}
-	db.Close()
-
-	numKVs := 0
-	opts := Options{
-		Logf:      t.Logf,
-		WatchFunc: func(kvs []KV) { numKVs += len(kvs) },
-	}
-	db, err = New(ctx, etcdURL(t), opts)
-	if err != nil {
-		t.Fatal(err)
-	}
-	db.Close()
-
-	if want := 201; numKVs != want {
-		t.Errorf("numKVs=%d, want %d", numKVs, want)
-	}
-}
-
 func TestGetRange(t *testing.T) {
 	etcdDeleteAll(t)
 	testGetRange(t, etcdURL(t))
@@ -533,22 +480,6 @@ func testGetRange(t *testing.T, url string) {
 	want = []KV{{"/b/1", nil, []byte("b1")}, {"/b/2", nil, []byte("b2")}, {"/b/3", nil, []byte("b3")}}
 	if !reflect.DeepEqual(want, kvs) {
 		t.Errorf(`GetRange("/b/")=%v, want %v`, kvs, want)
-	}
-}
-
-func TestAddOne(t *testing.T) {
-	tests := []struct{ key, res string }{
-		{"", ""},
-		{"/", "0"},
-		{"/db/", "/db0"},
-		{"/db/a", "/db/b"},
-		{"/db/\xff\xff", "/db0"},
-	}
-	for _, test := range tests {
-		got := string(addOne([]byte(test.key)))
-		if got != test.res {
-			t.Errorf("addOne(%q)=%q, want %q", test.key, got, test.res)
-		}
 	}
 }
 

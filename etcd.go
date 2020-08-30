@@ -1,4 +1,4 @@
-// Package etcd implements an etcd v3 client.
+// Package etcd implements an total-memory-cache etcd v3 client.
 //
 // The client maintains a complete copy of the etcd database in memory,
 // with values decoded into Go objects.
@@ -46,18 +46,6 @@
 // implementation cannot synchronously issue transactions.
 //
 //
-// Implementation Notes
-//
-// Built on the gRPC JSON gateway:
-// https://etcd.io/docs/v3.4.0/dev-guide/api_grpc_gateway
-// This costs us in throughput and latency to etcd, while keeping gRPC
-// (and its ops overhead) out of our software.
-//
-// As the REST API is generated from the gRPC API, this is the
-// canonical source for figuring out commands:
-// https://github.com/etcd-io/etcd/blob/master/etcdserver/etcdserverpb/rpc.proto
-//
-//
 // Object Ownership
 //
 // The cache in etcd.DB is very careful not to copy objects both into
@@ -72,13 +60,9 @@
 package etcd
 
 import (
-	"bufio"
-	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io/ioutil"
 	"log"
 	"net/http"
 	"reflect"
@@ -86,6 +70,9 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"go.etcd.io/etcd/clientv3"
+	"go.etcd.io/etcd/mvcc/mvccpb"
 )
 
 // ErrTxStale is reported when another transaction has modified a key
@@ -99,6 +86,7 @@ var ErrTxClosed = errors.New("tx closed")
 
 // DB is a read-write datastore backed by etcd.
 type DB struct {
+	cli      *clientv3.Client
 	url      string
 	opts     Options
 	inMemory bool // entirely in-memory
@@ -219,7 +207,7 @@ type KV struct {
 // New loads the contents of an etcd prefix range and creates a *DB
 // for reading and writing from the prefix range.
 //
-// The url value is the etcd JSON HTTP endpoint, e.g. "http://localhost:2379".
+// The url value is the etcd HTTP endpoint, e.g. "http://localhost:2379".
 //
 // As a special case, the url may be "memory://".
 // In this mode, the DB does not connect to any etcd server, instead all
@@ -229,6 +217,7 @@ func New(ctx context.Context, url string, opts Options) (*DB, error) {
 	if err != nil {
 		return nil, err
 	}
+
 	db := &DB{
 		url:     url,
 		opts:    opts,
@@ -238,6 +227,11 @@ func New(ctx context.Context, url string, opts Options) (*DB, error) {
 	if db.url == "memory://" {
 		db.inMemory = true
 	} else {
+		var err error
+		db.cli, err = clientv3.NewFromURL(url)
+		if err != nil {
+			return nil, fmt.Errorf("etcd.New: %v", err)
+		}
 		if err := db.loadAll(ctx); err != nil {
 			return nil, fmt.Errorf("etcd.New: could not load: %w", err)
 		}
@@ -257,26 +251,12 @@ func (db *DB) watchRoutine(ctx context.Context) {
 	if db.inMemory {
 		return
 	}
-	for {
-		if ctx.Err() != nil {
-			return
+	if err := db.watch(ctx); err != nil {
+		if ctx.Err() == nil {
+			panic("etcd.watch: " + err.Error())
 		}
-		if err := db.watch(ctx); err != nil {
-			if errors.Is(err, context.Canceled) {
-				return
-			}
-			db.opts.Logf("etcd.watch: %v", err)
-		}
-		// TODO(crawshaw): the obvious thing to do here, backoff,
-		// isn't what we want in practice unless we design the server
-		// to handle being disconnected from the DB. What to do?
-		t := time.NewTimer(1 * time.Second)
-		select {
-		case <-ctx.Done():
-			t.Stop()
-			return
-		case <-t.C:
-		}
+		// otherwise, context was canceled so exit gracefully
+		db.opts.Logf("etcd.watch: shutdown")
 	}
 }
 
@@ -561,101 +541,27 @@ func (tx *Tx) Commit() (err error) {
 		cancel()
 	}()
 
-	// Here we build the transaction request to etcd.
-	// There are some light examples of this API here:
-	//
-	//	https://etcd.io/docs/v3.4.0/dev-guide/api_grpc_gateway/
-	//
-	// The canonical definition of this interface is the underlying
-	// protos that are being mechanically converted to JSON:
-	//
-	//	https://github.com/etcd-io/etcd/blob/master/etcdserver/etcdserverpb/rpc.proto#L606
-	//
-	type txnCompare struct { // message Compare
-		ModRevision rev    `json:"mod_revision"`
-		Result      string `json:"result"`
-		Target      string `json:"target"`
-		Key         []byte `json:"key"`
-	}
-	type txnSuccess struct { // message RequestOp
-		RequestPut struct {
-			Key   []byte `json:"key"`
-			Value []byte `json:"value"`
-		} `json:"requestPut"`
-	}
-	var txnReq struct { // message TxnRequest
-		Compare []txnCompare `json:"compare,omitempty"` // conditions
-		Success []txnSuccess `json:"success"`           // actions if conditions met
-	}
+	var cmps []clientv3.Cmp
 	for key := range tx.cmps {
 		// Here we set the required mod revision of every key
 		// we ever fetched in the transaction, and require it
 		// not to have changed since we started.
-		txnReq.Compare = append(txnReq.Compare, txnCompare{
-			ModRevision: tx.maxRev + 1,
-			Result:      "LESS",
-			Target:      "MOD",
-			Key:         []byte(key),
-		})
+		cmps = append(cmps, clientv3.Compare(clientv3.ModRevision(key), "<", int64(tx.maxRev+1)))
 	}
+	var puts []clientv3.Op
 	for key, val := range tx.puts {
 		data, err := tx.db.opts.EncodeFunc(key, val)
 		if err != nil {
 			return fmt.Errorf("EncodeFunc failed for key %q: %v", key, err)
 		}
-
-		var s txnSuccess
-		s.RequestPut.Key = []byte(key)
-		s.RequestPut.Value = data
-		txnReq.Success = append(txnReq.Success, s)
-	}
-	data, err := json.Marshal(txnReq)
-	if err != nil {
-		return err
+		puts = append(puts, clientv3.OpPut(key, string(data)))
 	}
 
-	req, err := http.NewRequest("POST", tx.db.url+"/v3/kv/txn", bytes.NewReader(data))
+	txn := tx.db.cli.Txn(ctx)
+	txn = txn.If(cmps...).Then(puts...)
+	txnRes, err := txn.Commit()
 	if err != nil {
 		return err
-	}
-	if tx.db.opts.AuthHeader != "" {
-		req.Header.Set("Authorization", tx.db.opts.AuthHeader)
-	}
-	req = req.WithContext(ctx)
-	res, err := tx.db.opts.HTTPC.Do(req)
-	if err != nil {
-		return err
-	}
-	defer res.Body.Close()
-	if res.StatusCode != 200 {
-		b, _ := ioutil.ReadAll(res.Body)
-		str := string(b)
-		if res.StatusCode == 400 && strings.Contains(str, "too many operations") {
-			builder := new(strings.Builder)
-			fmt.Fprintf(builder, "cmps (%d):", len(tx.cmps))
-			for key := range tx.cmps {
-				fmt.Fprintf(builder, "\n\t%s", key)
-			}
-			fmt.Fprintf(builder, "\nputs (%d):", len(tx.puts))
-			for _, s := range txnReq.Success {
-				fmt.Fprintf(builder, "\n\t%s: %s", s.RequestPut.Key, s.RequestPut.Value)
-			}
-			return fmt.Errorf("too many operations: %s", builder)
-		}
-		return fmt.Errorf("status=%d: %q", res.StatusCode, str)
-	}
-	var txnRes struct { // message TxnResponse
-		Header struct {
-			Revision rev `json:"revision"`
-		} `json:"header"`
-		Succeeded bool `json:"succeeded"`
-	}
-	b, err := ioutil.ReadAll(res.Body)
-	if err != nil {
-		return fmt.Errorf("read response: %w: %s", err, b)
-	}
-	if err := json.NewDecoder(bytes.NewReader(b)).Decode(&txnRes); err != nil {
-		return fmt.Errorf("decode response: %w: %v", err, b)
 	}
 	if !txnRes.Succeeded {
 		if len(tx.puts) == 1 {
@@ -668,7 +574,7 @@ func (tx *Tx) Commit() (err error) {
 		return ErrTxStale
 	}
 
-	txRev := txnRes.Header.Revision
+	txRev := rev(txnRes.Header.Revision)
 	var done chan struct{}
 
 	tx.db.Mu.Lock()
@@ -775,109 +681,36 @@ type valueRev struct {
 // The etcd server assigns a mod revision to every KV and to the whole database.
 type rev int64
 
-func (r rev) MarshalText() (text []byte, err error) {
-	return []byte(fmt.Sprintf("%d", int64(r))), nil
-}
-func (r *rev) UnmarshalText(text []byte) error {
-	_, err := fmt.Sscanf(string(text), "%d", (*int64)(r))
-	return err
-}
-
 // watch issues a long-running watch request against etcd.
 // Each transaction is received es a line of JSON.
 func (db *DB) watch(ctx context.Context) error {
-	var watchRequest struct {
-		CreateRequest struct {
-			Key           []byte `json:"key"`
-			RangeEnd      []byte `json:"range_end"`
-			StartRevision int64  `json:"start_revision"`
-		} `json:"create_request"`
-	}
-	watchRequest.CreateRequest.Key = []byte(db.opts.KeyPrefix)
-	watchRequest.CreateRequest.RangeEnd = addOne([]byte(db.opts.KeyPrefix))
-
 	db.Mu.RLock()
-	watchRequest.CreateRequest.StartRevision = int64(db.rev)
+	startRevision := int64(db.rev)
 	db.Mu.RUnlock()
 
-	data, err := json.Marshal(watchRequest)
-	if err != nil {
-		return err
-	}
-	req, err := http.NewRequest("POST", db.url+"/v3/watch", bytes.NewReader(data))
-	if err != nil {
-		return err
-	}
-	if db.opts.AuthHeader != "" {
-		req.Header.Set("Authorization", db.opts.AuthHeader)
-	}
-	req = req.WithContext(ctx)
-	res, err := db.opts.HTTPC.Do(req)
-	if err != nil {
-		return err
-	}
-	defer res.Body.Close()
-	if res.StatusCode != 200 {
-		b, _ := ioutil.ReadAll(res.Body)
-		return fmt.Errorf("status=%d: %q", res.StatusCode, string(b))
-	}
+	ch := db.cli.Watch(ctx, db.opts.KeyPrefix, clientv3.WithPrefix(), clientv3.WithRev(startRevision))
 
-	// TODO(crawshaw): can we query the maximum size from etcd?
-	const fiveMB = 5 << 20
-	scanner := bufio.NewScanner(res.Body)
-	scanner.Buffer(nil, fiveMB)
-	for scanner.Scan() {
-		if err := db.watchResult(scanner.Bytes()); err != nil {
+	for res := range ch {
+		if err := res.Err(); err != nil {
+			return err
+		}
+		if err := db.watchResult(&res); err != nil {
 			return err
 		}
 	}
-	if err := scanner.Err(); err != nil {
-		return err
-	}
-	return nil
+	return fmt.Errorf("etcd.watch: [unexpected] watchchan closed")
 }
 
 // watchResult processes a JSON blob from the etcd watch API.
-func (db *DB) watchResult(data []byte) error {
-	var watchResult struct {
-		Result struct { // message WatchResponse
-			Header struct { // message ResponseHeader
-				Revision rev `json:"revision"`
-			} `json:"header"`
-			Created  bool `json:"created"`
-			Fragment bool `json:"fragment"`
-			Events   []struct {
-				Type string `json:"type"`
-				KV   struct {
-					Key         []byte `json:"key"`
-					ModRevision rev    `json:"mod_revision"`
-					Value       []byte `json:"value"`
-				} `json:"kv"`
-			} `json:"events"`
-		} `json:"result"`
-	}
-	if err := json.Unmarshal(data, &watchResult); err != nil {
-		return err
-	}
-
-	if watchResult.Result.Created {
-		// Note that created=true can be sent with a header revision
-		// that will be repeated in a subsequent watch result message
-		// including events, so we must not increment db.rev here.
-		if len(watchResult.Result.Events) > 0 {
-			panic("watch creation message contains events: " + string(data))
-		}
-		return nil
-	}
-
+func (db *DB) watchResult(res *clientv3.WatchResponse) error {
 	type newkv struct {
 		key      string
 		valueRev valueRev
 	}
 	var newkvs []newkv
 
-	for _, ev := range watchResult.Result.Events {
-		key := string(ev.KV.Key)
+	for _, ev := range res.Events {
+		key := string(ev.Kv.Key)
 
 		// As a first pass, we check the cache to see if we can avoid decoding
 		// the value. This is a performance optimization, it's entirely possible
@@ -887,25 +720,25 @@ func (db *DB) watchResult(data []byte) error {
 		kv, exists := db.cache[key]
 		db.Mu.RUnlock()
 
-		if exists && ev.KV.ModRevision <= kv.modRev {
+		if exists && rev(ev.Kv.ModRevision) <= kv.modRev {
 			// We already have this value.
 			continue
 		}
 
-		if ev.Type == "DELETE" {
-			db.opts.Logf("etcd.watch: TODO delete key %s", ev.KV.Key)
+		if ev.Type == mvccpb.DELETE {
+			db.opts.Logf("etcd.watch: TODO delete key %s", ev.Kv.Key)
 			continue
 		}
 
-		v, err := db.opts.DecodeFunc(key, ev.KV.Value)
+		v, err := db.opts.DecodeFunc(key, ev.Kv.Value)
 		if err != nil {
-			panic(fmt.Sprintf("etcd.watch: bad decoded value for key %q: %v: %q", key, err, string(ev.KV.Value)))
+			panic(fmt.Sprintf("etcd.watch: bad decoded value for key %q: %v: %q", key, err, string(ev.Kv.Value)))
 		}
 		newkvs = append(newkvs, newkv{
 			key: key,
 			valueRev: valueRev{
 				value:  v,
-				modRev: ev.KV.ModRevision,
+				modRev: rev(ev.Kv.ModRevision),
 			},
 		})
 	}
@@ -931,15 +764,13 @@ func (db *DB) watchResult(data []byte) error {
 		sort.Slice(kvs, func(i, j int) bool { return kvs[i].Key < kvs[j].Key })
 		db.opts.WatchFunc(kvs)
 	}
-	if !watchResult.Result.Fragment {
-		db.rev = rev(watchResult.Result.Header.Revision)
-		for rev, doneChs := range db.pending {
-			if rev <= db.rev {
-				for _, done := range doneChs {
-					close(done)
-				}
-				delete(db.pending, rev)
+	db.rev = rev(res.Header.Revision)
+	for rev, doneChs := range db.pending {
+		if rev <= db.rev {
+			for _, done := range doneChs {
+				close(done)
 			}
+			delete(db.pending, rev)
 		}
 	}
 	db.Mu.Unlock()
@@ -966,139 +797,30 @@ func (db *DB) loadAll(ctx context.Context) error {
 	db.Mu.Lock()
 	defer db.Mu.Unlock()
 
-	// loadPageLimit is the maximum number of records returned by a
-	// /range request.
-	//
-	// By default etcd is configured with a maximum message size and
-	// if you request more keys than that it returns an HTTP status
-	// 429 error:
-	//
-	//	{"error":"grpc: received message larger than max (16761782 vs. 4194304)","code":8}
-	//
-	// To avoid this we set a limit on the number of keys we request.
-	// It may be too big. So we look for the error message and shrink
-	// the limit until the request succeeds.
-	loadPageLimit := initLoadPageLimit
-
-	startKey := []byte(db.opts.KeyPrefix)
-	endKey := addOne([]byte(db.opts.KeyPrefix))
-	var maxModRev rev
-	for len(startKey) > 0 {
-		keyRange := etcdRangeRequest{
-			Key:            startKey,
-			RangeEnd:       endKey,
-			Limit:          loadPageLimit,
-			MaxModRevision: maxModRev,
-		}
-		nextKey, dbRev, err := db.load(ctx, keyRange)
-		if err != nil {
-			if errors.Is(err, errReqTooBig) && loadPageLimit > 128 {
-				db.opts.Logf("etcd.New: load range of %d keys too big, trying fewer", loadPageLimit)
-				loadPageLimit /= 2
-				continue
-			}
-			return err
-		}
-		if maxModRev == 0 {
-			maxModRev = dbRev
-		}
-		startKey = nextKey
-	}
-	db.rev = maxModRev
-	return nil
-}
-
-var initLoadPageLimit = 4096 // variable for testing
-
-var errReqTooBig = errors.New("req too big, make it smaller")
-
-// etcdRangeRequest is a JSON representation of the proto message RangeRequest.
-type etcdRangeRequest struct {
-	Key            []byte `json:"key"`
-	RangeEnd       []byte `json:"range_end,omitempty"`
-	Limit          int    `json:"limit,omitempty"`
-	MaxModRevision rev    `json:"max_mod_revision,omitempty"`
-}
-
-// load issues a range request against etcd for the range startKey-endKey
-// and processes up to loadPageLimit keys.
-//
-// keys versions are pinned at maxModRev (0 means the current db revision).
-// This can be used to ensure a range request spread across several calls
-// to load gets a consistent view of the database.
-//
-// When load returns it reports the next key in the cursor and the db
-// revision the range request was issued at.
-func (db *DB) load(ctx context.Context, keyRange etcdRangeRequest) (nextKey []byte, dbRev rev, err error) {
-	keyRangeData, err := json.Marshal(keyRange)
+	start := time.Now()
+	resp, err := db.cli.Get(ctx, db.opts.KeyPrefix, clientv3.WithPrefix())
 	if err != nil {
-		return nil, 0, err
+		return err
 	}
-	req, err := http.NewRequest("POST", db.url+"/v3/kv/range", bytes.NewReader(keyRangeData))
-	if err != nil {
-		return nil, 0, err
+	fmt.Printf("etcd.loadAll: %d KVs fetched in %s\n", resp.Count, time.Since(start).Round(time.Millisecond))
+	if resp.More {
+		fmt.Printf("etcd.loadAll ERROR resp.More=true\n")
 	}
-	if db.opts.AuthHeader != "" {
-		req.Header.Set("Authorization", db.opts.AuthHeader)
-	}
-	req = req.WithContext(ctx)
-	res, err := db.opts.HTTPC.Do(req)
-	if err != nil {
-		return nil, 0, err
-	}
-	defer res.Body.Close()
-	if res.StatusCode != 200 {
-		b, _ := ioutil.ReadAll(res.Body)
-		const (
-			grpcOK                = 0
-			grpcResourceExhausted = 8
-		)
-		var errMsg struct {
-			Error string `json:"error"`
-			// Code is the gRPC status response code.
-			// https://developers.google.com/maps-booking/reference/grpc-api/status_codes
-			Code int `json:"code"`
-		}
-		if err := json.Unmarshal(b, &errMsg); err == nil && errMsg.Code != grpcOK {
-			if res.StatusCode == 429 && errMsg.Code == 8 {
-				return nil, 0, fmt.Errorf("%w: %s", errReqTooBig, errMsg.Error)
-			}
-			return nil, 0, fmt.Errorf("/range code=%d/%d: %s", res.StatusCode, errMsg.Code, errMsg.Error)
-		}
-		return nil, 0, fmt.Errorf("key range status=%d: %q", res.StatusCode, string(b))
-	}
-
-	var rangeResponse struct {
-		Header struct {
-			Revision rev `json:"revision"`
-		} `json:"header"`
-		KVs []struct {
-			ModRevision rev    `json:"mod_revision"`
-			Key         []byte `json:"key"`
-			Value       []byte `json:"value"`
-		} `json:"kvs"`
-		More bool `json:"more"`
-	}
-	if err := json.NewDecoder(res.Body).Decode(&rangeResponse); err != nil {
-		return nil, 0, err
-	}
-	dbRev = rangeResponse.Header.Revision
-
 	var kvs []KV
-	for _, kv := range rangeResponse.KVs {
+	for _, kv := range resp.Kvs {
 		key := string(kv.Key)
 		v, err := db.opts.DecodeFunc(key, kv.Value)
 		if err != nil {
-			return nil, 0, fmt.Errorf("%q: cannot decode: %w", key, err)
+			return fmt.Errorf("%q: cannot decode: %w", key, err)
 		}
 		db.cache[key] = valueRev{
 			value:  v,
-			modRev: kv.ModRevision,
+			modRev: rev(kv.ModRevision),
 		}
 		if db.opts.WatchFunc != nil {
 			cloned, err := db.clone(key, v)
 			if err != nil {
-				return nil, 0, fmt.Errorf("%q clone of decoded value failed: %w", key, err)
+				return fmt.Errorf("%q clone of decoded value failed: %w", key, err)
 			}
 			kvs = append(kvs, KV{Key: key, Value: cloned})
 		}
@@ -1106,22 +828,8 @@ func (db *DB) load(ctx context.Context, keyRange etcdRangeRequest) (nextKey []by
 	if len(kvs) > 0 {
 		db.opts.WatchFunc(kvs)
 	}
-
-	if rangeResponse.More {
-		nextKey = addOne([]byte(rangeResponse.KVs[len(rangeResponse.KVs)-1].Key))
-	}
-	return nextKey, dbRev, nil
-}
-
-// addOne modifies v to be the next key in lexicographic order.
-func addOne(v []byte) []byte {
-	for len(v) > 0 && v[len(v)-1] == 0xff {
-		v = v[:len(v)-1]
-	}
-	if len(v) > 0 {
-		v[len(v)-1]++
-	}
-	return v
+	db.rev = rev(resp.Header.Revision)
+	return nil
 }
 
 func (tx *Tx) get(key string) (bool, valueRev, error) {
