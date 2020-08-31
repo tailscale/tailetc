@@ -87,7 +87,6 @@ var ErrTxClosed = errors.New("tx closed")
 // DB is a read-write datastore backed by etcd.
 type DB struct {
 	cli      *clientv3.Client
-	url      string
 	opts     Options
 	inMemory bool // entirely in-memory
 
@@ -207,28 +206,29 @@ type KV struct {
 // New loads the contents of an etcd prefix range and creates a *DB
 // for reading and writing from the prefix range.
 //
-// The url value is the etcd HTTP endpoint, e.g. "http://localhost:2379".
+// The urls parameter is a comma-separated list of etcd HTTP endpoint,
+// e.g. "http://1.1.1.1:2379,http://2.2.2.2:2379".
 //
-// As a special case, the url may be "memory://".
+// As a special case, urls may be "memory://".
 // In this mode, the DB does not connect to any etcd server, instead all
 // operations are performed on the in-memory cache.
-func New(ctx context.Context, url string, opts Options) (*DB, error) {
+func New(ctx context.Context, urls string, opts Options) (*DB, error) {
 	opts, err := opts.fillDefaults()
 	if err != nil {
 		return nil, err
 	}
 
 	db := &DB{
-		url:     url,
 		opts:    opts,
 		cache:   map[string]valueRev{},
 		pending: map[rev][]chan struct{}{},
 	}
-	if db.url == "memory://" {
+	if urls == "memory://" {
 		db.inMemory = true
 	} else {
+		eps := strings.Split(urls, ",")
 		var err error
-		db.cli, err = clientv3.New(clientv3.Config{Endpoints: []string{url}})
+		db.cli, err = clientv3.New(clientv3.Config{Endpoints: eps})
 		if err != nil {
 			return nil, fmt.Errorf("etcd.New: %v", err)
 		}
