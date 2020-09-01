@@ -149,6 +149,9 @@ type Options struct {
 	//
 	// The called WatchFunc owns the values passed to it.
 	WatchFunc func([]KV)
+	// DeleteAllOnStart deletes all keys when the client is created.
+	// Used for testing.
+	DeleteAllOnStart bool
 }
 
 func (opts Options) fillDefaults() (Options, error) {
@@ -231,6 +234,13 @@ func New(ctx context.Context, urls string, opts Options) (*DB, error) {
 		db.cli, err = clientv3.New(clientv3.Config{Endpoints: eps})
 		if err != nil {
 			return nil, fmt.Errorf("etcd.New: %v", err)
+		}
+		if opts.DeleteAllOnStart {
+			_, err := db.cli.Delete(ctx, opts.KeyPrefix, clientv3.WithPrefix())
+			if err != nil {
+				db.cli.Close()
+				return nil, fmt.Errorf("etcd.New: %v", err)
+			}
 		}
 		if err := db.loadAll(ctx); err != nil {
 			return nil, fmt.Errorf("etcd.New: could not load: %w", err)

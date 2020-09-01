@@ -76,11 +76,10 @@ var personOptions = Options{
 		}
 		return nil
 	},
+	DeleteAllOnStart: true,
 }
 
 func TestDB(t *testing.T) {
-	etcdDeleteAll(t)
-
 	ctx := context.Background()
 	alice := person{ID: 42, Name: "Alice", LikesIceCream: true}
 
@@ -134,6 +133,7 @@ func TestDB(t *testing.T) {
 	t.Run("readwrite-newdb", func(t *testing.T) {
 		opts := personOptions
 		opts.Logf = t.Logf
+		opts.DeleteAllOnStart = false // we want to read the prev keys
 		db, err := New(ctx, etcdURL(t), opts)
 		if err != nil {
 			t.Fatal(err)
@@ -157,6 +157,7 @@ func TestDB(t *testing.T) {
 	t.Run("newline", func(t *testing.T) {
 		opts := personOptions
 		opts.Logf = t.Logf
+		opts.DeleteAllOnStart = false // we want to read the prev keys
 		db, err := New(ctx, etcdURL(t), opts)
 		if err != nil {
 			t.Fatal(err)
@@ -209,7 +210,6 @@ func TestDB(t *testing.T) {
 }
 
 func TestStaleTx(t *testing.T) {
-	etcdDeleteAll(t)
 	testStaleTx(t, etcdURL(t))
 }
 
@@ -332,7 +332,6 @@ func testStaleTx(t *testing.T, url string) {
 }
 
 func TestVariableKeys(t *testing.T) {
-	etcdDeleteAll(t)
 	testVariableKeys(t, etcdURL(t))
 }
 
@@ -390,8 +389,6 @@ func testVariableKeys(t *testing.T, url string) {
 }
 
 func TestExternalValue(t *testing.T) {
-	etcdDeleteAll(t)
-
 	watchCh := make(chan []KV, 8)
 	ctx := context.Background()
 	opts := personOptions
@@ -431,7 +428,6 @@ func TestExternalValue(t *testing.T) {
 }
 
 func TestGetRange(t *testing.T) {
-	etcdDeleteAll(t)
 	testGetRange(t, etcdURL(t))
 }
 
@@ -441,7 +437,7 @@ func TestGetRangeInMemory(t *testing.T) {
 
 func testGetRange(t *testing.T, url string) {
 	ctx := context.Background()
-	db, err := New(ctx, url, Options{Logf: t.Logf})
+	db, err := New(ctx, url, Options{Logf: t.Logf, DeleteAllOnStart: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -484,8 +480,6 @@ func testGetRange(t *testing.T, url string) {
 }
 
 func BenchmarkPutOver(b *testing.B) {
-	etcdDeleteAll(b)
-
 	ctx := context.Background()
 	opts := personOptions
 	opts.Logf = b.Logf
@@ -508,8 +502,6 @@ func BenchmarkPutOver(b *testing.B) {
 }
 
 func BenchmarkPut(b *testing.B) {
-	etcdDeleteAll(b)
-
 	ctx := context.Background()
 	opts := personOptions
 	opts.Logf = b.Logf
@@ -536,8 +528,6 @@ func BenchmarkPutX4(b *testing.B) { benchmarkPutX(b, 4) }
 func BenchmarkPutX8(b *testing.B) { benchmarkPutX(b, 8) }
 
 func benchmarkPutX(b *testing.B, x int) {
-	etcdDeleteAll(b)
-
 	ctx := context.Background()
 	opts := personOptions
 	opts.Logf = b.Logf
@@ -594,15 +584,6 @@ func TestMain(m *testing.M) {
 	exitCode := m.Run()
 	cleanup()
 	os.Exit(exitCode)
-}
-
-func etcdDeleteAll(t testing.TB) {
-	t.Helper()
-	out, err := exec.Command("etcdctl", "--endpoints="+etcdURL(t), "del", `""`, "--from-key=true").CombinedOutput()
-	if err != nil {
-		t.Logf("delete all failed:\n%s", out)
-		t.Fatal(err)
-	}
 }
 
 func runEtcd() (clientURL string, cleanup func(), err error) {
