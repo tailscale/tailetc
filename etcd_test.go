@@ -107,6 +107,14 @@ func TestDB(t *testing.T) {
 		} else if !found {
 			t.Errorf("could not get pending /db/person/bob entry")
 		}
+		err = tx.UnsafePeek("/db/person/bob", func(v interface{}) {
+			if gotName := v.(person).Name; gotName != "Bob" {
+				t.Fatalf("UnsafePeek Name=%s, want Bob", gotName)
+			}
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
 		tx.Put("/db/person/bob", person{ID: 43, Name: "Bob", LikesIceCream: true})
 		if found, err := tx.Get("/db/person/bob", &gotBob); err != nil {
 			t.Fatal(err)

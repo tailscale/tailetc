@@ -384,6 +384,25 @@ func (tx *Tx) Get(key string, value interface{}) (found bool, err error) {
 	return true, nil
 }
 
+// UnsafePeek lets the caller see the cached value for a key.
+//
+// It is vital that the caller does not modify the value, or the DB will
+// be corrupted.
+func (tx *Tx) UnsafePeek(key string, peekFunc func(v interface{})) error {
+	if tx.Err != nil {
+		return tx.Err
+	}
+	found, kv, err := tx.get(key)
+	if err != nil {
+		return err
+	}
+	if !found {
+		return fmt.Errorf("etcd.UnsafePeek(%q): not found", key)
+	}
+	peekFunc(kv.value)
+	return nil
+}
+
 // GetRange gets a range of KV-pairs from the etcd cache.
 //
 // The parameter fn is called with batches of matching KV-pairs.
