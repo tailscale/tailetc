@@ -388,19 +388,19 @@ func (tx *Tx) Get(key string, value interface{}) (found bool, err error) {
 //
 // It is vital that the caller does not modify the value, or the DB will
 // be corrupted.
-func (tx *Tx) UnsafePeek(key string, peekFunc func(v interface{})) error {
+func (tx *Tx) UnsafePeek(key string, peekFunc func(v interface{})) (found bool, err error) {
 	if tx.Err != nil {
-		return tx.Err
+		return false, tx.Err
 	}
 	found, kv, err := tx.get(key)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if !found {
-		return fmt.Errorf("etcd.UnsafePeek(%q): not found", key)
+		return false, nil
 	}
 	peekFunc(kv.value)
-	return nil
+	return true, nil
 }
 
 // GetRange gets a range of KV-pairs from the etcd cache.

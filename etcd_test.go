@@ -107,11 +107,14 @@ func TestDB(t *testing.T) {
 		} else if !found {
 			t.Errorf("could not get pending /db/person/bob entry")
 		}
-		err = tx.UnsafePeek("/db/person/bob", func(v interface{}) {
+		found, err := tx.UnsafePeek("/db/person/bob", func(v interface{}) {
 			if gotName := v.(person).Name; gotName != "Bob" {
 				t.Fatalf("UnsafePeek Name=%s, want Bob", gotName)
 			}
 		})
+		if !found {
+			t.Fatal("UnsafePeek could not find key")
+		}
 		if err != nil {
 			t.Fatal(err)
 		}
