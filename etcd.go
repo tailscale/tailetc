@@ -27,7 +27,7 @@
 //
 //	Do not have writer contention on individual keys.
 //
-// Everything else should follow a programmer's intution for an
+// Everything else should follow a programmer's intuition for an
 // in-memory map guarded by a RWMutex.
 //
 //
