@@ -427,7 +427,7 @@ func (db *DB) GetRange(keyPrefix string, fn func([]KV) error, finalFn func()) (e
 	}()
 
 	// First take a read lock and send all relevant KV-pairs to fn.
-	// This should include alomst all of the KV-space.
+	// This should include almost all of the KV-space.
 	db.Mu.RLock()
 	revDone := db.rev
 	err = db.getRange(keyPrefix, fn, 0)
