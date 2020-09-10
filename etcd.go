@@ -442,11 +442,11 @@ func (db *DB) GetRange(keyPrefix string, fn func([]KV) error, finalFn func()) (e
 	//
 	// The double pass is to minimize the time GetRange holds the write lock.
 	db.Mu.Lock()
+	defer db.Mu.Unlock()
 	err = db.getRange(keyPrefix, fn, revDone+1)
 	if err == nil && finalFn != nil {
 		finalFn()
 	}
-	db.Mu.Unlock()
 
 	return err
 }
@@ -777,6 +777,8 @@ func (db *DB) watchResult(res *clientv3.WatchResponse) error {
 	}
 
 	db.Mu.Lock()
+	defer db.Mu.Unlock()
+
 	var kvs []KV
 	for _, newkv := range newkvs {
 		kv, exists := db.cache[newkv.key]
@@ -806,7 +808,6 @@ func (db *DB) watchResult(res *clientv3.WatchResponse) error {
 			delete(db.pending, rev)
 		}
 	}
-	db.Mu.Unlock()
 
 	return nil
 }
