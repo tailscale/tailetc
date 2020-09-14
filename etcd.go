@@ -66,6 +66,7 @@ import (
 	"log"
 	"net/http"
 	"reflect"
+	"runtime/pprof"
 	"sort"
 	"strings"
 	"sync"
@@ -73,6 +74,7 @@ import (
 
 	"go.etcd.io/etcd/clientv3"
 	"go.etcd.io/etcd/mvcc/mvccpb"
+	"tailscale.com/syncs"
 )
 
 // ErrTxStale is reported when another transaction has modified a key
@@ -252,6 +254,21 @@ func New(ctx context.Context, urls string, opts Options) (*DB, error) {
 	db.shutdownWG.Add(1)
 	db.watchCancel = cancel
 	go db.watchRoutine(watchCtx)
+
+	db.shutdownWG.Add(1)
+	const watchdogMax = 30 * time.Second
+	watchdogCh := syncs.Watch(watchCtx, &db.Mu, 30*time.Second, watchdogMax)
+	go func() {
+		defer db.shutdownWG.Done()
+		for d := range watchdogCh {
+			if d == watchdogMax {
+				buf := new(strings.Builder)
+				pprof.Lookup("goroutine").WriteTo(buf, 1)
+				db.opts.Logf("etcd watchdog timeout stack:\n%s", buf.String())
+				log.Fatalf("etcd watchdog timeout")
+			}
+		}
+	}()
 
 	return db, nil
 }
