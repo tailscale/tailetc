@@ -62,6 +62,7 @@ package etcd
 import (
 	"context"
 	"errors"
+	"expvar"
 	"fmt"
 	"log"
 	"net/http"
@@ -85,6 +86,13 @@ var ErrTxStale = errors.New("tx stale")
 // ErrTxClosed is reported when a method is called on a committed or
 // canceled Tx.
 var ErrTxClosed = errors.New("tx closed")
+
+// dbMuLockLatency reports the most recent time it took to lock db.Mu.
+var dbMuLockLatency = new(expvar.Int)
+
+func init() {
+	expvar.Publish("db_mu_lock_latency", dbMuLockLatency)
+}
 
 // DB is a read-write datastore backed by etcd.
 type DB struct {
@@ -261,6 +269,7 @@ func New(ctx context.Context, urls string, opts Options) (*DB, error) {
 	go func() {
 		defer db.shutdownWG.Done()
 		for d := range watchdogCh {
+			dbMuLockLatency.Set(int64(d))
 			if d == watchdogMax {
 				buf := new(strings.Builder)
 				pprof.Lookup("goroutine").WriteTo(buf, 1)
