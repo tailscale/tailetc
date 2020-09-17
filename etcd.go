@@ -741,7 +741,7 @@ type valueRev struct {
 type rev int64
 
 // watch issues a long-running watch request against etcd.
-// Each transaction is received es a line of JSON.
+// Each transaction is received as a line of JSON.
 func (db *DB) watch(ctx context.Context) error {
 	db.Mu.RLock()
 	startRevision := int64(db.rev)
@@ -857,15 +857,17 @@ func (db *DB) loadAll(ctx context.Context) error {
 	db.Mu.Lock()
 	defer db.Mu.Unlock()
 
+	db.opts.Logf("etcd.loadAll: loading all KVs with prefix %s", db.opts.KeyPrefix)
 	start := time.Now()
 	resp, err := db.cli.Get(ctx, db.opts.KeyPrefix, clientv3.WithPrefix())
 	if err != nil {
 		return err
 	}
-	fmt.Printf("etcd.loadAll: %d KVs fetched in %s\n", resp.Count, time.Since(start).Round(time.Millisecond))
+	db.opts.Logf("etcd.loadAll: %d KVs fetched in %s\n", resp.Count, time.Since(start).Round(time.Millisecond))
 	if resp.More {
-		fmt.Printf("etcd.loadAll ERROR resp.More=true\n")
+		db.opts.Logf("etcd.loadAll ERROR resp.More=true\n")
 	}
+	start = time.Now()
 	var kvs []KV
 	for _, kv := range resp.Kvs {
 		key := string(kv.Key)
@@ -889,6 +891,7 @@ func (db *DB) loadAll(ctx context.Context) error {
 		db.opts.WatchFunc(kvs)
 	}
 	db.rev = rev(resp.Header.Revision)
+	db.opts.Logf("etcd.loadAll: %d KVs processed in %s\n", resp.Count, time.Since(start).Round(time.Millisecond))
 	return nil
 }
 
