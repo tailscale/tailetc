@@ -857,23 +857,53 @@ func (db *DB) loadAll(ctx context.Context) error {
 	db.Mu.Lock()
 	defer db.Mu.Unlock()
 
-	db.opts.Logf("etcd.loadAll: loading all KVs with prefix %s", db.opts.KeyPrefix)
-	start := time.Now()
-	resp, err := db.cli.Get(ctx, db.opts.KeyPrefix, clientv3.WithPrefix())
-	if err != nil {
-		return err
+	for {
+		start := time.Now()
+		db.opts.Logf("etcd.loadAll: loading all KVs with prefix %s", db.opts.KeyPrefix)
+		opts := []clientv3.OpOption{clientv3.WithPrefix()}
+		if db.rev != 0 {
+			opts = append(opts, clientv3.WithMinModRev(int64(db.rev)+1))
+		}
+		resp, err := db.cli.Get(ctx, db.opts.KeyPrefix, opts...)
+		if err != nil {
+			return err
+		}
+		db.opts.Logf("etcd.loadAll: %d/%d KVs fetched in %s", len(resp.Kvs), resp.Count, time.Since(start).Round(time.Millisecond))
+		if resp.More {
+			return fmt.Errorf("etcd.loadAll ERROR resp.More=true")
+		}
+
+		loadStart := time.Now()
+		kvs, err := db.loadLocked(resp)
+		if err != nil {
+			return err
+		}
+		db.opts.Logf("etcd.loadAll: %d KVs loaded in %s", len(kvs), time.Since(loadStart).Round(time.Millisecond))
+
+		if len(kvs) > 0 {
+			watchFuncStart := time.Now()
+			db.opts.WatchFunc(kvs)
+			db.opts.Logf("etcd.loadAll: %d KVs processed in %s", len(kvs), time.Since(watchFuncStart).Round(time.Millisecond))
+		}
+
+		db.rev = rev(resp.Header.Revision)
+
+		if time.Since(start) < 1*time.Minute {
+			break
+		}
+		db.opts.Logf("etcd.loadAll: slow load; loading diff from modrev %d", db.rev)
 	}
-	db.opts.Logf("etcd.loadAll: %d KVs fetched in %s\n", resp.Count, time.Since(start).Round(time.Millisecond))
-	if resp.More {
-		db.opts.Logf("etcd.loadAll ERROR resp.More=true\n")
-	}
-	start = time.Now()
+
+	return nil
+}
+
+func (db *DB) loadLocked(resp *clientv3.GetResponse) ([]KV, error) {
 	var kvs []KV
 	for _, kv := range resp.Kvs {
 		key := string(kv.Key)
 		v, err := db.opts.DecodeFunc(key, kv.Value)
 		if err != nil {
-			return fmt.Errorf("%q: cannot decode: %w", key, err)
+			return nil, fmt.Errorf("%q: cannot decode: %w", key, err)
 		}
 		db.cache[key] = valueRev{
 			value:  v,
@@ -882,17 +912,12 @@ func (db *DB) loadAll(ctx context.Context) error {
 		if db.opts.WatchFunc != nil {
 			cloned, err := db.clone(key, v)
 			if err != nil {
-				return fmt.Errorf("%q clone of decoded value failed: %w", key, err)
+				return nil, fmt.Errorf("%q clone of decoded value failed: %w", key, err)
 			}
 			kvs = append(kvs, KV{Key: key, Value: cloned})
 		}
 	}
-	if len(kvs) > 0 {
-		db.opts.WatchFunc(kvs)
-	}
-	db.rev = rev(resp.Header.Revision)
-	db.opts.Logf("etcd.loadAll: %d KVs processed in %s\n", resp.Count, time.Since(start).Round(time.Millisecond))
-	return nil
+	return kvs, nil
 }
 
 func (tx *Tx) get(key string) (bool, valueRev, error) {
