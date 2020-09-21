@@ -71,6 +71,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"go.etcd.io/etcd/clientv3"
@@ -103,6 +104,8 @@ type DB struct {
 	done        <-chan struct{}
 	watchCancel func()
 	shutdownWG  sync.WaitGroup // shutdownWG.Add is called under mu when !closing
+
+	panicOnWrite int32 // testing hook: panic any time a write is requested
 
 	// Mu is the database lock.
 	//
@@ -575,6 +578,10 @@ func (tx *Tx) Commit() (err error) {
 		return nil
 	}
 
+	if atomic.LoadInt32(&tx.db.panicOnWrite) > 0 {
+		panic("db.PanicOnWrite: db write detected")
+	}
+
 	if tx.db.inMemory {
 		return tx.commitInMemory()
 	}
@@ -918,6 +925,19 @@ func (db *DB) loadLocked(resp *clientv3.GetResponse) ([]KV, error) {
 		}
 	}
 	return kvs, nil
+}
+
+// PanicOnWrite sets whether the db should panic when a write is requested.
+// It is used in tests to ensure that particular actions do not create db writes.
+// Calls to PanicOnWrite may be nested.
+func (db *DB) PanicOnWrite(enable bool) {
+	if enable {
+		atomic.AddInt32(&db.panicOnWrite, 1)
+	} else {
+		if atomic.AddInt32(&db.panicOnWrite, -1) < 0 {
+			panic("db.PanicOnWrite underflow")
+		}
+	}
 }
 
 func (tx *Tx) get(key string) (bool, valueRev, error) {
