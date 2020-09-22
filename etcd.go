@@ -940,6 +940,12 @@ func (db *DB) PanicOnWrite(enable bool) {
 	}
 }
 
+// UnsafeClient exposes the raw underlying etcd client used by the database.
+// Use with extreme care.
+func (db *DB) UnsafeClient() *clientv3.Client {
+	return db.cli
+}
+
 func (tx *Tx) get(key string) (bool, valueRev, error) {
 	if !strings.HasPrefix(key, tx.db.opts.KeyPrefix) {
 		return false, valueRev{}, fmt.Errorf("key does not use prefix %s", tx.db.opts.KeyPrefix)
