@@ -792,7 +792,7 @@ func (db *DB) watchResult(res *clientv3.WatchResponse) error {
 		}
 
 		if ev.Type == mvccpb.DELETE {
-			db.opts.Logf("etcd.watch: TODO delete key %s", ev.Kv.Key)
+			// db.opts.Logf("etcd.watch: TODO delete key %s", ev.Kv.Key)
 			continue
 		}
 
