@@ -228,43 +228,71 @@ type KV struct {
 // As a special case, urls may be "memory://".
 // In this mode, the DB does not connect to any etcd server, instead all
 // operations are performed on the in-memory cache.
-func New(ctx context.Context, urls string, opts Options) (*DB, error) {
-	opts, err := opts.fillDefaults()
+func New(ctx context.Context, urls string, opts Options) (db *DB, err error) {
+	defer func() {
+		if err != nil {
+			err = fmt.Errorf("etcd.New: %w", err)
+		}
+	}()
+
+	opts, err = opts.fillDefaults()
 	if err != nil {
 		return nil, err
 	}
 
-	db := &DB{
+	db = &DB{
 		opts:    opts,
 		cache:   map[string]valueRev{},
 		pending: map[rev][]chan struct{}{},
 	}
+	watchCtx, cancel := context.WithCancel(context.Background())
+	db.done = watchCtx.Done()
+	db.watchCancel = cancel
+
 	if urls == "memory://" {
 		db.inMemory = true
-	} else {
-		eps := strings.Split(urls, ",")
-		var err error
-		db.cli, err = clientv3.New(clientv3.Config{Endpoints: eps})
+		return db, nil
+	}
+
+	eps := strings.Split(urls, ",")
+	db.cli, err = clientv3.New(clientv3.Config{Endpoints: eps})
+	if err != nil {
+		return nil, fmt.Errorf("etcd.New: %v", err)
+	}
+	if opts.DeleteAllOnStart {
+		_, err := db.cli.Delete(ctx, opts.KeyPrefix, clientv3.WithPrefix())
 		if err != nil {
-			return nil, fmt.Errorf("etcd.New: %v", err)
-		}
-		if opts.DeleteAllOnStart {
-			_, err := db.cli.Delete(ctx, opts.KeyPrefix, clientv3.WithPrefix())
-			if err != nil {
-				db.cli.Close()
-				return nil, fmt.Errorf("etcd.New: %v", err)
-			}
-		}
-		if err := db.loadAll(ctx); err != nil {
-			return nil, fmt.Errorf("etcd.New: could not load: %w", err)
+			db.cli.Close()
+			return nil, err
 		}
 	}
 
-	watchCtx, cancel := context.WithCancel(context.Background())
-	db.done = watchCtx.Done()
+	watchCh := db.cli.Watch(watchCtx, db.opts.KeyPrefix, clientv3.WithPrefix(), clientv3.WithCreatedNotify())
+	firstWatchRes := <-watchCh // etcd watch sends a creation event
+	if len(firstWatchRes.Events) > 0 {
+		if err := db.watchResult(&firstWatchRes); err != nil {
+			return nil, fmt.Errorf("first watch: %w", err)
+		}
+	}
+	db.Mu.Lock()
+	db.rev = rev(firstWatchRes.Header.Revision)
+	db.Mu.Unlock()
+
 	db.shutdownWG.Add(1)
-	db.watchCancel = cancel
-	go db.watchRoutine(watchCtx)
+	go func() {
+		defer db.shutdownWG.Done()
+		if err := db.watch(watchCh); err != nil {
+			if watchCtx.Err() == nil {
+				panic("etcd.watch: " + err.Error())
+			}
+			// otherwise, context was canceled so exit gracefully
+			db.opts.Logf("etcd.watch: shutdown")
+		}
+	}()
+
+	if err := db.loadAll(ctx); err != nil {
+		return nil, fmt.Errorf("etcd.New: could not load: %w", err)
+	}
 
 	db.shutdownWG.Add(1)
 	const watchdogMax = 30 * time.Second
@@ -283,20 +311,6 @@ func New(ctx context.Context, urls string, opts Options) (*DB, error) {
 	}()
 
 	return db, nil
-}
-
-func (db *DB) watchRoutine(ctx context.Context) {
-	defer db.shutdownWG.Done()
-	if db.inMemory {
-		return
-	}
-	if err := db.watch(ctx); err != nil {
-		if ctx.Err() == nil {
-			panic("etcd.watch: " + err.Error())
-		}
-		// otherwise, context was canceled so exit gracefully
-		db.opts.Logf("etcd.watch: shutdown")
-	}
 }
 
 // ReadTx create a new read-only transaction.
@@ -749,13 +763,7 @@ type rev int64
 
 // watch issues a long-running watch request against etcd.
 // Each transaction is received as a line of JSON.
-func (db *DB) watch(ctx context.Context) error {
-	db.Mu.RLock()
-	startRevision := int64(db.rev)
-	db.Mu.RUnlock()
-
-	ch := db.cli.Watch(ctx, db.opts.KeyPrefix, clientv3.WithPrefix(), clientv3.WithRev(startRevision))
-
+func (db *DB) watch(ch clientv3.WatchChan) error {
 	for res := range ch {
 		if err := res.Err(); err != nil {
 			return err
@@ -856,61 +864,53 @@ func (db *DB) clone(key string, val interface{}) (interface{}, error) {
 // loadAll loads all the keys from etcd into DB using a series of
 // paged range requests.
 //
-// The requests are pinned at a specific db revision number to ensure the
-// final view of the database is consistent. The watchRoutine then starts
-// requesting keys at the revision we pinned the load at, so that all
-// changes that happen during the load are correctly played into DB.
+// The requests are not pinned to any version. To get a consistent view
+// of the DB, a watcher must be started before loadAll is called.
 func (db *DB) loadAll(ctx context.Context) error {
-	db.Mu.Lock()
-	defer db.Mu.Unlock()
+	const batchSize = 200
+	start := time.Now()
+	db.opts.Logf("etcd.loadAll: loading all KVs with prefix %s", db.opts.KeyPrefix)
+	opts := []clientv3.OpOption{
+		clientv3.WithLimit(batchSize),
+		clientv3.WithRange(clientv3.GetPrefixRangeEnd(db.opts.KeyPrefix)),
+	}
 
+	loaded := 0
+	key := db.opts.KeyPrefix
 	for {
-		start := time.Now()
-		db.opts.Logf("etcd.loadAll: loading all KVs with prefix %s", db.opts.KeyPrefix)
-		opts := []clientv3.OpOption{clientv3.WithPrefix()}
-		if db.rev != 0 {
-			opts = append(opts, clientv3.WithMinModRev(int64(db.rev)+1))
-		}
-		resp, err := db.cli.Get(ctx, db.opts.KeyPrefix, opts...)
+		resp, err := db.cli.Get(ctx, key, opts...)
 		if err != nil {
 			return err
 		}
-		db.opts.Logf("etcd.loadAll: %d/%d KVs fetched in %s", len(resp.Kvs), resp.Count, time.Since(start).Round(time.Millisecond))
-		if resp.More {
-			return fmt.Errorf("etcd.loadAll ERROR resp.More=true")
-		}
-
-		loadStart := time.Now()
-		kvs, err := db.loadLocked(resp)
+		count, err := db.load(resp)
 		if err != nil {
 			return err
 		}
-		db.opts.Logf("etcd.loadAll: %d KVs loaded in %s", len(kvs), time.Since(loadStart).Round(time.Millisecond))
-
-		if len(kvs) > 0 {
-			watchFuncStart := time.Now()
-			db.opts.WatchFunc(kvs)
-			db.opts.Logf("etcd.loadAll: %d KVs processed in %s", len(kvs), time.Since(watchFuncStart).Round(time.Millisecond))
-		}
-
-		db.rev = rev(resp.Header.Revision)
-
-		if time.Since(start) < 1*time.Minute {
+		loaded += count
+		if !resp.More {
 			break
 		}
-		db.opts.Logf("etcd.loadAll: slow load; loading diff from modrev %d", db.rev)
+		key = string(append(resp.Kvs[len(resp.Kvs)-1].Key, 0))
 	}
+
+	db.opts.Logf("etcd.loadAll: %d KVs loaded in %s", loaded, time.Since(start).Round(time.Millisecond))
 
 	return nil
 }
 
-func (db *DB) loadLocked(resp *clientv3.GetResponse) ([]KV, error) {
+func (db *DB) load(resp *clientv3.GetResponse) (count int, err error) {
+	db.Mu.Lock()
+	defer db.Mu.Unlock()
+
 	var kvs []KV
 	for _, kv := range resp.Kvs {
 		key := string(kv.Key)
+		if _, exists := db.cache[key]; exists {
+			continue // skip keys already filled by watch
+		}
 		v, err := db.opts.DecodeFunc(key, kv.Value)
 		if err != nil {
-			return nil, fmt.Errorf("%q: cannot decode: %w", key, err)
+			return 0, fmt.Errorf("%q: cannot decode: %w", key, err)
 		}
 		db.cache[key] = valueRev{
 			value:  v,
@@ -919,12 +919,17 @@ func (db *DB) loadLocked(resp *clientv3.GetResponse) ([]KV, error) {
 		if db.opts.WatchFunc != nil {
 			cloned, err := db.clone(key, v)
 			if err != nil {
-				return nil, fmt.Errorf("%q clone of decoded value failed: %w", key, err)
+				return 0, fmt.Errorf("%q clone of decoded value failed: %w", key, err)
 			}
 			kvs = append(kvs, KV{Key: key, Value: cloned})
 		}
 	}
-	return kvs, nil
+
+	if len(kvs) > 0 {
+		db.opts.WatchFunc(kvs)
+	}
+
+	return len(kvs), nil
 }
 
 // PanicOnWrite sets whether the db should panic when a write is requested.
