@@ -875,43 +875,65 @@ func (db *DB) loadAll(ctx context.Context) error {
 		clientv3.WithRange(clientv3.GetPrefixRangeEnd(db.opts.KeyPrefix)),
 	}
 
-	loaded := 0
+	errCh := make(chan error)
+	countCh := make(chan int)
+
+	batches := 0
 	key := db.opts.KeyPrefix
 	for {
+		batches++
 		resp, err := db.cli.Get(ctx, key, opts...)
 		if err != nil {
 			return err
 		}
-		count, err := db.load(resp)
-		if err != nil {
-			return err
-		}
-		loaded += count
+		go func() {
+			count, err := db.load(resp)
+			errCh <- err
+			countCh <- count
+		}()
 		if !resp.More {
 			break
 		}
 		key = string(append(resp.Kvs[len(resp.Kvs)-1].Key, 0))
 	}
+	db.opts.Logf("etcd.loadAll: KVs read from DB in %s", time.Since(start).Round(time.Millisecond))
 
-	db.opts.Logf("etcd.loadAll: %d KVs loaded in %s", loaded, time.Since(start).Round(time.Millisecond))
+	var err error
+	loaded := 0
+	for i := 0; i < batches; i++ {
+		if err2 := <-errCh; err == nil {
+			err = err2
+		}
+		loaded += <-countCh
+	}
+	if err != nil {
+		return err
+	}
 
+	db.opts.Logf("etcd.loadAll: %d KVs read and decoded in %s", loaded, time.Since(start).Round(time.Millisecond))
 	return nil
 }
 
 func (db *DB) load(resp *clientv3.GetResponse) (count int, err error) {
+	var vals []interface{}
+	for _, kv := range resp.Kvs {
+		v, err := db.opts.DecodeFunc(string(kv.Key), kv.Value)
+		if err != nil {
+			return 0, fmt.Errorf("%q: cannot decode: %w", string(kv.Key), err)
+		}
+		vals = append(vals, v)
+	}
+
 	db.Mu.Lock()
 	defer db.Mu.Unlock()
 
 	var kvs []KV
-	for _, kv := range resp.Kvs {
+	for i, kv := range resp.Kvs {
 		key := string(kv.Key)
 		if _, exists := db.cache[key]; exists {
 			continue // skip keys already filled by watch
 		}
-		v, err := db.opts.DecodeFunc(key, kv.Value)
-		if err != nil {
-			return 0, fmt.Errorf("%q: cannot decode: %w", key, err)
-		}
+		v := vals[i]
 		db.cache[key] = valueRev{
 			value:  v,
 			modRev: rev(kv.ModRevision),
