@@ -867,7 +867,7 @@ func (db *DB) clone(key string, val interface{}) (interface{}, error) {
 // The requests are not pinned to any version. To get a consistent view
 // of the DB, a watcher must be started before loadAll is called.
 func (db *DB) loadAll(ctx context.Context) error {
-	const batchSize = 200
+	const batchSize = 1000
 	start := time.Now()
 	db.opts.Logf("etcd.loadAll: loading all KVs with prefix %s", db.opts.KeyPrefix)
 	opts := []clientv3.OpOption{
@@ -877,6 +877,7 @@ func (db *DB) loadAll(ctx context.Context) error {
 
 	errCh := make(chan error)
 	countCh := make(chan int)
+	respSizeCh := make(chan int)
 
 	batches := 0
 	key := db.opts.KeyPrefix
@@ -890,6 +891,12 @@ func (db *DB) loadAll(ctx context.Context) error {
 			count, err := db.load(resp)
 			errCh <- err
 			countCh <- count
+
+			n := 0
+			for _, kv := range resp.Kvs {
+				n += len(kv.Value)
+			}
+			respSizeCh <- n
 		}()
 		if !resp.More {
 			break
@@ -900,17 +907,22 @@ func (db *DB) loadAll(ctx context.Context) error {
 
 	var err error
 	loaded := 0
+	maxRespSize := 0
 	for i := 0; i < batches; i++ {
 		if err2 := <-errCh; err == nil {
 			err = err2
 		}
 		loaded += <-countCh
+		if n := <-respSizeCh; n > maxRespSize {
+			maxRespSize = n
+		}
 	}
 	if err != nil {
 		return err
 	}
 
 	db.opts.Logf("etcd.loadAll: %d KVs read and decoded in %s", loaded, time.Since(start).Round(time.Millisecond))
+	db.opts.Logf("etcd.loadAll: %d batches read, largest batch was %d bytes", batches, maxRespSize)
 	return nil
 }
 
