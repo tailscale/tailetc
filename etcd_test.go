@@ -1,30 +1,19 @@
 package etcd
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io/ioutil"
-	"os"
-	"os/exec"
-	"path/filepath"
 	"reflect"
-	"runtime"
 	"sort"
 	"strings"
 	"testing"
 	"time"
 )
 
-var etcdURLVal string
-
 func etcdURL(tb testing.TB) string {
-	if etcdURLVal == "" {
-		tb.Skip("skipping test, no etcd installed in PATH")
-	}
-	return etcdURLVal
+	return "file://" + tb.TempDir()
 }
 
 // person is a database value test object used with the keys "/db/person/".
@@ -80,13 +69,16 @@ var personOptions = Options{
 }
 
 func TestDB(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	alice := person{ID: 42, Name: "Alice", LikesIceCream: true}
+
+	url := "file://" + t.TempDir()
 
 	t.Run("readwrite", func(t *testing.T) {
 		opts := personOptions
 		opts.Logf = t.Logf
-		db, err := New(ctx, etcdURL(t), opts)
+		db, err := New(ctx, url, opts)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -145,7 +137,7 @@ func TestDB(t *testing.T) {
 		opts := personOptions
 		opts.Logf = t.Logf
 		opts.DeleteAllOnStart = false // we want to read the prev keys
-		db, err := New(ctx, etcdURL(t), opts)
+		db, err := New(ctx, url, opts)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -169,7 +161,7 @@ func TestDB(t *testing.T) {
 		opts := personOptions
 		opts.Logf = t.Logf
 		opts.DeleteAllOnStart = false // we want to read the prev keys
-		db, err := New(ctx, etcdURL(t), opts)
+		db, err := New(ctx, url, opts)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -217,14 +209,15 @@ func TestDB(t *testing.T) {
 			t.Error(pendingErr)
 		}
 	})
-
 }
 
 func TestStaleTx(t *testing.T) {
+	t.Parallel()
 	testStaleTx(t, etcdURL(t))
 }
 
 func TestStaleTxInMemory(t *testing.T) {
+	t.Parallel()
 	testStaleTx(t, "memory://")
 }
 
@@ -343,10 +336,12 @@ func testStaleTx(t *testing.T, url string) {
 }
 
 func TestVariableKeys(t *testing.T) {
+	t.Parallel()
 	testVariableKeys(t, etcdURL(t))
 }
 
 func TestVariableKeysInMemory(t *testing.T) {
+	t.Parallel()
 	testVariableKeys(t, "memory://")
 }
 
@@ -399,50 +394,13 @@ func testVariableKeys(t *testing.T, url string) {
 	}
 }
 
-func TestExternalValue(t *testing.T) {
-	watchCh := make(chan []KV, 8)
-	ctx := context.Background()
-	opts := personOptions
-	opts.Logf = t.Logf
-	opts.WatchFunc = func(kvs []KV) {
-		watchCh <- kvs
-	}
-	db, err := New(ctx, etcdURL(t), opts)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-
-	key := "/db/person/charlie"
-	val := person{Name: "Charlie"}
-
-	valBytes, err := json.Marshal(val)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	out, err := exec.Command("etcdctl", "--endpoints="+etcdURL(t), "put", key, string(valBytes)).CombinedOutput()
-	if err != nil {
-		t.Fatalf("etcdctl put failed: %v, stderr:\n%s", err, out)
-	}
-
-	want := []KV{{key, nil, val}}
-
-	select {
-	case got := <-watchCh:
-		if !reflect.DeepEqual(got, want) {
-			t.Errorf("Watch=%v, want %v", got, want)
-		}
-	case <-time.After(10 * time.Second):
-		t.Fatalf("no watch update")
-	}
-}
-
 func TestGetRange(t *testing.T) {
+	t.Parallel()
 	testGetRange(t, etcdURL(t))
 }
 
 func TestGetRangeInMemory(t *testing.T) {
+	t.Parallel()
 	testGetRange(t, "memory://")
 }
 
@@ -511,7 +469,6 @@ func BenchmarkPutOver(b *testing.B) {
 		}
 	}
 }
-
 func BenchmarkPut(b *testing.B) {
 	ctx := context.Background()
 	opts := personOptions
@@ -578,82 +535,4 @@ func benchmarkPutX(b *testing.B, x int) {
 		case <-limit:
 		}
 	}
-}
-
-func TestMain(m *testing.M) {
-	if _, err := exec.Command("which", "etcd").CombinedOutput(); err != nil {
-		etcdURLVal = ""
-		os.Exit(m.Run())
-	}
-
-	url, cleanup, err := runEtcd()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "cannot start etcd: %v", err)
-		os.Exit(1)
-	}
-	etcdURLVal = url
-	exitCode := m.Run()
-	cleanup()
-	os.Exit(exitCode)
-}
-
-func runEtcd() (clientURL string, cleanup func(), err error) {
-	tempDir, err := ioutil.TempDir("", "etcd-test-")
-	if err != nil {
-		return "", nil, err
-	}
-
-	peerURL := "http://localhost:22380"
-	clientURL = "http://localhost:22379"
-	dataDir := filepath.Join(tempDir, "default.etcd")
-	cmd := exec.Command(
-		"etcd",
-		"-data-dir", dataDir,
-		"-listen-peer-urls", peerURL,
-		"-initial-advertise-peer-urls", peerURL,
-		"-initial-cluster", "default="+peerURL,
-		"-listen-client-urls", clientURL,
-		"-advertise-client-urls", clientURL,
-	)
-	if runtime.GOARCH == "arm64" {
-		cmd.Env = []string{"ETCD_UNSUPPORTED_ARCH=arm64"}
-	}
-	wait := &waitForStartWriter{started: make(chan struct{})}
-	cmd.Stdout = wait
-	cmd.Stderr = wait
-	if err := cmd.Start(); err != nil {
-		os.RemoveAll(tempDir)
-		return "", nil, err
-	}
-	timer := time.NewTimer(10 * time.Second)
-	defer timer.Stop()
-	select {
-	case <-wait.started:
-	case <-timer.C:
-		cmd.Process.Kill()
-		return "", nil, fmt.Errorf("timeout waiting for etcd to start, stderr:\n\n %s", wait.buf.Bytes())
-	}
-	return clientURL, func() {
-		cmd.Process.Kill()
-		os.RemoveAll(tempDir)
-	}, nil
-}
-
-type waitForStartWriter struct {
-	started chan struct{}
-	buf     bytes.Buffer
-}
-
-func (w *waitForStartWriter) Write(b []byte) (int, error) {
-	select {
-	case <-w.started:
-		return len(b), nil
-	default:
-	}
-
-	w.buf.Write(b)
-	if bytes.Contains(w.buf.Bytes(), []byte("ready to serve client requests")) {
-		close(w.started)
-	}
-	return len(b), nil
 }

@@ -66,6 +66,8 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os"
+	"path/filepath"
 	"reflect"
 	"runtime/pprof"
 	"sort"
@@ -75,7 +77,9 @@ import (
 	"time"
 
 	"go.etcd.io/etcd/clientv3"
+	"go.etcd.io/etcd/embed"
 	"go.etcd.io/etcd/mvcc/mvccpb"
+	"go.etcd.io/etcd/pkg/types"
 	"tailscale.com/syncs"
 )
 
@@ -104,6 +108,7 @@ type DB struct {
 	done        <-chan struct{}
 	watchCancel func()
 	shutdownWG  sync.WaitGroup // shutdownWG.Add is called under mu when !closing
+	embedClose  func()
 
 	panicOnWrite int32 // testing hook: panic any time a write is requested
 
@@ -225,9 +230,17 @@ type KV struct {
 // The urls parameter is a comma-separated list of etcd HTTP endpoint,
 // e.g. "http://1.1.1.1:2379,http://2.2.2.2:2379".
 //
-// As a special case, urls may be "memory://".
-// In this mode, the DB does not connect to any etcd server, instead all
-// operations are performed on the in-memory cache.
+// There are two special case values of urls:
+//
+// If urls is "memory://", the DB does not connect to any etcd server,
+// instead all operations are performed on the in-memory cache.
+//
+// If urls starts with the prefix "file://" then an embedded copy of etcd
+// is started and creates the database in a "tailscale.etcd" directory
+// under the referenced path. For example, the urls value "file:///data"
+// uses an etcd database stored in "/data/tailscale.etcd".
+// If only the prefix is provided, that is urls equals "file://", then
+// an embedded etcd is started in the current working directory.
 func New(ctx context.Context, urls string, opts Options) (db *DB, err error) {
 	defer func() {
 		if err != nil {
@@ -253,8 +266,62 @@ func New(ctx context.Context, urls string, opts Options) (db *DB, err error) {
 		db.inMemory = true
 		return db, nil
 	}
+	var eps []string
+	if strings.HasPrefix(urls, "file://") {
+		randURLs, err := types.NewURLs([]string{"http://127.0.0.1:0"})
+		if err != nil {
+			return nil, err
+		}
 
-	eps := strings.Split(urls, ",")
+		cfg := embed.NewConfig()
+		cfg.LCUrls = randURLs
+		cfg.ACUrls = randURLs
+		cfg.LPUrls = randURLs
+		cfg.APUrls = randURLs
+		cfg.InitialCluster = cfg.InitialClusterFromName(cfg.Name)
+		cfg.Dir = filepath.Join(strings.TrimPrefix(urls, "file://"), "tailscale.etcd")
+		cfg.Logger = "zap" // set to avoid data race in the default logger
+
+		if strings.HasPrefix(cfg.Dir, os.TempDir()) {
+			// Well this is a pickle.
+			// The tradeoff here is startup time vs. long-running efficiency.
+			// Etcd does a leader election on startup even in single-node mode,
+			// and the default value of ElectionMs is 1000 meaning it takes a
+			// full second to start. That really hurts tests.
+			//
+			// But the election timeout must be 5x the heartbeat interval, so
+			// to do a faster initial election, we have to commit to far more
+			// frequent heartbeats (which are meaningless in a single-node
+			// embedded cluster).
+			//
+			// So we crank the heartbeats to every 15ms if the data dir is
+			// in $TMPDIR. The CPU overhead is minimal in tests and the
+			// wall-time savings are huge.
+			cfg.TickMs = 15
+			cfg.ElectionMs = 75
+		} else {
+			cfg.TickMs = 50
+			cfg.ElectionMs = 250
+		}
+
+		start := time.Now()
+		e, err := embed.StartEtcd(cfg)
+		if err != nil {
+			return nil, fmt.Errorf("embedded server failed to start: %v", err)
+		}
+		db.embedClose = e.Close
+		select {
+		case <-e.Server.ReadyNotify():
+		case <-ctx.Done():
+			e.Server.Stop() // trigger a shutdown
+			return nil, fmt.Errorf("embedded server took too long to start")
+		}
+		db.opts.Logf("etcd: embedded server started in %s (election timeout: %dms)", time.Since(start).Round(time.Microsecond), cfg.ElectionMs)
+		eps = []string{"http://" + e.Clients[0].Addr().String()}
+	} else {
+		eps = strings.Split(urls, ",")
+	}
+
 	db.cli, err = clientv3.New(clientv3.Config{Endpoints: eps})
 	if err != nil {
 		return nil, fmt.Errorf("etcd.New: %v", err)
@@ -337,10 +404,14 @@ func (db *DB) Close() error {
 	db.watchCancel()
 	db.shutdownWG.Wait()
 
+	var err error
 	if db.cli != nil {
-		return db.cli.Close()
+		err = db.cli.Close()
 	}
-	return nil
+	if db.embedClose != nil {
+		db.embedClose()
+	}
+	return err
 }
 
 // A Tx is an etcd transaction.
