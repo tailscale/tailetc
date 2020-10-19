@@ -220,8 +220,8 @@ func (opts Options) fillDefaults() (Options, error) {
 // Both the old value being replaced and the new value are provided, decoded.
 type KV struct {
 	Key      string
-	OldValue interface{}
-	Value    interface{}
+	OldValue interface{} // nil if there is no old value
+	Value    interface{} // nil if the key has been deleted
 }
 
 // New loads the contents of an etcd prefix range and creates a *DB
@@ -431,6 +431,8 @@ type Tx struct {
 	//
 	// The memory passed to PendingUpdate are only valid for the
 	// duration of the call and must not be modified.
+	//
+	// A nil new value means the key has been deleted.
 	PendingUpdate func(key string, old, new interface{})
 
 	// Err is any error reported by the transaction during use.
@@ -584,6 +586,9 @@ func (db *DB) getRange(keyPrefix string, fn func([]KV) error, min rev) error {
 		if kv.modRev < min {
 			continue
 		}
+		if kv.value == nil {
+			continue // deleted key
+		}
 		cloned, err := db.clone(key, kv.value)
 		if err != nil {
 			return fmt.Errorf("clone %s: %w", key, err)
@@ -607,6 +612,7 @@ func (db *DB) getRange(keyPrefix string, fn func([]KV) error, min rev) error {
 
 // Put adds or replaces a KV-pair in the transaction.
 // If a newer value for the key is in the DB this will return ErrTxStale.
+// A nil value deletes the key.
 func (tx *Tx) Put(key string, value interface{}) error {
 	if tx.ro {
 		err := fmt.Errorf("etcd.Put(%q) called on read-only transaction", key)
@@ -626,10 +632,13 @@ func (tx *Tx) Put(key string, value interface{}) error {
 	if tx.puts == nil {
 		tx.puts = make(map[string]interface{})
 	}
-	cloned, err := tx.db.clone(key, value)
-	if err != nil {
-		tx.Err = fmt.Errorf("etcd.Put(%q): %w", key, err)
-		return tx.Err
+	var cloned interface{}
+	if value != nil {
+		cloned, err = tx.db.clone(key, value)
+		if err != nil {
+			tx.Err = fmt.Errorf("etcd.Put(%q): %w", key, err)
+			return tx.Err
+		}
 	}
 	if tx.PendingUpdate != nil {
 		tx.PendingUpdate(key, curVal.value, value)
@@ -701,6 +710,10 @@ func (tx *Tx) Commit() (err error) {
 	}
 	var puts []clientv3.Op
 	for key, val := range tx.puts {
+		if val == nil {
+			puts = append(puts, clientv3.OpDelete(key))
+			continue
+		}
 		data, err := tx.db.opts.EncodeFunc(key, val)
 		if err != nil {
 			return fmt.Errorf("EncodeFunc failed for key %q: %v", key, err)
@@ -785,13 +798,17 @@ func (tx *Tx) commitCacheLocked(modRev rev) {
 			modRev: modRev,
 		}
 		if tx.db.opts.WatchFunc != nil {
-			cloned, err := tx.db.clone(key, val)
-			if err != nil {
-				// By this point, we know val is the output of CloneFunc
-				// called earlier in Tx.Put. That CloneFunc fails on
-				// the value's second pass through suggests a bug in
-				// the implementation of CloneFunc.
-				panic(fmt.Sprintf("etcd tx watch second clone of %q failed: %v", key, err))
+			var cloned interface{}
+			if val != nil {
+				var err error
+				cloned, err = tx.db.clone(key, val)
+				if err != nil {
+					// By this point, we know val is the output of CloneFunc
+					// called earlier in Tx.Put. That CloneFunc fails on
+					// the value's second pass through suggests a bug in
+					// the implementation of CloneFunc.
+					panic(fmt.Sprintf("etcd tx watch second clone of %q failed: %v", key, err))
+				}
 			}
 			kvs = append(kvs, KV{Key: key, OldValue: kv.value, Value: cloned})
 		}
@@ -824,7 +841,7 @@ func (tx *Tx) commitInMemory() error {
 
 // valueRev is a decoded database value paired with its etcd mod revision.
 type valueRev struct {
-	value  interface{} // decoded value
+	value  interface{} // decoded value, nil if key was deleted
 	modRev rev         // mod revision of this value
 }
 
@@ -871,7 +888,12 @@ func (db *DB) watchResult(res *clientv3.WatchResponse) error {
 		}
 
 		if ev.Type == mvccpb.DELETE {
-			// db.opts.Logf("etcd.watch: TODO delete key %s", ev.Kv.Key)
+			newkvs = append(newkvs, newkv{
+				key: key,
+				valueRev: valueRev{
+					modRev: rev(ev.Kv.ModRevision),
+				},
+			})
 			continue
 		}
 
@@ -898,10 +920,18 @@ func (db *DB) watchResult(res *clientv3.WatchResponse) error {
 			// Value has just been updated by a Tx, keep newer value.
 			continue
 		}
+		if !exists && newkv.valueRev.value == nil {
+			// Value has been deleted but we never knew about it, ignore.
+			continue
+		}
 		if db.opts.WatchFunc != nil {
-			cloned, err := db.clone(newkv.key, newkv.valueRev.value)
-			if err != nil {
-				panic(fmt.Sprintf("etcd.watch clone of %q failed: %v", newkv.key, err))
+			var cloned interface{}
+			if newkv.valueRev.value != nil {
+				var err error
+				cloned, err = db.clone(newkv.key, newkv.valueRev.value)
+				if err != nil {
+					panic(fmt.Sprintf("etcd.watch clone of %q failed: %v", newkv.key, err))
+				}
 			}
 			kvs = append(kvs, KV{Key: newkv.key, OldValue: kv.value, Value: cloned})
 		}
@@ -1063,6 +1093,9 @@ func (tx *Tx) get(key string) (bool, valueRev, error) {
 
 	putValue, isPut := tx.puts[key]
 	if isPut {
+		if putValue == nil {
+			return false, valueRev{}, nil
+		}
 		v, err := tx.db.clone(key, putValue)
 		if err != nil {
 			return false, valueRev{}, err
@@ -1081,11 +1114,11 @@ func (tx *Tx) get(key string) (bool, valueRev, error) {
 	}
 	tx.db.Mu.RUnlock()
 
-	if !ok {
-		return false, valueRev{}, nil
-	}
 	if tx.maxRev < kv.modRev {
 		return false, valueRev{}, ErrTxStale
+	}
+	if !ok || kv.value == nil {
+		return false, valueRev{}, nil
 	}
 	if !tx.ro {
 		if tx.cmps == nil {
