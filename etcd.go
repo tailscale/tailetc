@@ -827,11 +827,20 @@ func (tx *Tx) commitInMemory() error {
 	for key := range tx.puts {
 		kv, exists := tx.db.cache[key]
 		if !exists {
+			if tx.puts[key] == nil {
+				delete(tx.puts, key) // do not process no-op deletes
+			}
 			continue
 		}
 		if kv.modRev > tx.maxRev {
 			return fmt.Errorf("%w: key %s", ErrTxStale, key)
 		}
+		if tx.puts[key] == nil && kv.value == nil {
+			delete(tx.puts, key) // do not process no-op deletes
+		}
+	}
+	if len(tx.puts) == 0 {
+		return nil
 	}
 
 	tx.db.rev++

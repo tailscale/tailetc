@@ -10,6 +10,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/google/go-cmp/cmp"
 )
 
 func etcdURL(tb testing.TB) string {
@@ -445,6 +447,118 @@ func testGetRange(t *testing.T, url string) {
 	want = []KV{{"/b/1", nil, []byte("b1")}, {"/b/2", nil, []byte("b2")}, {"/b/3", nil, []byte("b3")}}
 	if !reflect.DeepEqual(want, kvs) {
 		t.Errorf(`GetRange("/b/")=%v, want %v`, kvs, want)
+	}
+}
+
+func TestDelete(t *testing.T) {
+	t.Parallel()
+	testDelete(t, etcdURL(t))
+}
+
+func TestDeleteInMemory(t *testing.T) {
+	t.Parallel()
+	testDelete(t, "memory://")
+}
+
+func testDelete(t *testing.T, url string) {
+	watch := make(chan []KV, 16)
+	watchFunc := func(kv []KV) {
+		watch <- kv
+	}
+	checkWatch := func(want []KV) {
+		t.Helper()
+		timer := time.NewTimer(5 * time.Second)
+		defer timer.Stop()
+		var got []KV
+		select {
+		case got = <-watch:
+		case <-timer.C:
+			t.Fatalf("timeout waiting for %v", want)
+		}
+		if !cmp.Equal(got, want) {
+			t.Errorf("watch got: %v,\nwant: %v", got, want)
+		}
+	}
+
+	ctx := context.Background()
+	db, err := New(ctx, url, Options{Logf: t.Logf, DeleteAllOnStart: true, WatchFunc: watchFunc})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	checkNoKey := func(tx *Tx, key string) {
+		t.Helper()
+		var got []byte
+		if found, err := tx.Get(key, &got); err != nil {
+			t.Fatalf("%s: %v", key, err)
+		} else if found {
+			t.Errorf("found deleted key: %s", key)
+		} else if got != nil {
+			t.Errorf("%s: got=%v, want nil", key, got)
+		}
+	}
+
+	tx := db.Tx(ctx)
+	tx.Put("/a/1", []byte("1"))
+	tx.Put("/a/2", []byte("2"))
+	tx.Put("/a/3", []byte("3"))
+	tx.Put("/b/1", []byte("b1"))
+	tx.Put("/b/2", []byte("b2"))
+	tx.Put("/b/3", []byte("b3"))
+	tx.Put("/b/3", nil)
+	checkNoKey(tx, "/b/3")
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	checkNoKey(db.ReadTx(), "/b/3")
+	checkWatch([]KV{
+		{Key: "/a/1", Value: []byte("1")},
+		{Key: "/a/2", Value: []byte("2")},
+		{Key: "/a/3", Value: []byte("3")},
+		{Key: "/b/1", Value: []byte("b1")},
+		{Key: "/b/2", Value: []byte("b2")},
+	})
+
+	tx = db.Tx(ctx)
+	pendingUpdate := errors.New("no pending update")
+	tx.PendingUpdate = func(key string, old, new interface{}) {
+		if key != "/b/2" {
+			pendingUpdate = fmt.Errorf("key=%q, want %q", key, "/b/2")
+			return
+		}
+		if !cmp.Equal(old, []byte("b2")) {
+			pendingUpdate = fmt.Errorf("old=%v, want 'b2'", old)
+			return
+		}
+		if new != nil {
+			pendingUpdate = fmt.Errorf("new=%v, want nil", new)
+			return
+		}
+		pendingUpdate = nil
+	}
+	checkNoKey(tx, "/b/3")
+	tx.Put("/b/2", nil)
+	if pendingUpdate != nil {
+		t.Fatalf("PendingUpdate: %v", pendingUpdate)
+	}
+	checkNoKey(tx, "/b/2")
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	checkWatch([]KV{
+		{Key: "/b/2", OldValue: []byte("b2"), Value: nil},
+	})
+
+	tx = db.Tx(ctx)
+	tx.Put("/b/2", nil)
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case got := <-watch:
+		t.Errorf("unexpected watch result: %v", got)
+	default:
 	}
 }
 
