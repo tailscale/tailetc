@@ -362,7 +362,7 @@ func New(ctx context.Context, urls string, opts Options) (db *DB, err error) {
 	}
 
 	db.shutdownWG.Add(1)
-	const watchdogMax = 30 * time.Second
+	const watchdogMax = 300 * time.Second
 	watchdogCh := syncs.Watch(watchCtx, &db.Mu, 30*time.Second, watchdogMax)
 	go func() {
 		defer db.shutdownWG.Done()
