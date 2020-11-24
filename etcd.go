@@ -1235,14 +1235,45 @@ func (db *DB) WatchKey(ctx context.Context, key string, fn func(old, new interfa
 		},
 	}
 
-	db.Mu.Lock()
-	defer db.Mu.Unlock()
-	if kv, ok := db.cache[key]; ok {
-		cloned, err := db.clone(key, kv.value)
+	// Two passes. First try to send the current value holding the read lock.
+	// This sometimes short-cuts the watch so no write lock is necessary.
+	// This mostly lets us call fn under the read lock, for better
+	// general concurrency.
+
+	db.Mu.RLock()
+	kv1, kv1ok := db.cache[key]
+	if kv1ok {
+		cloned, err := db.clone(key, kv1.value)
 		if err != nil {
+			db.Mu.RUnlock()
 			return fmt.Errorf("WatchKey clone %s: %w", key, err)
 		}
 		fn(nil, cloned)
+	}
+	db.Mu.RUnlock()
+
+	if ctx.Err() != nil {
+		return nil // first value was enough, call it quits
+	}
+
+	db.Mu.Lock()
+	defer db.Mu.Unlock()
+	if kv2, ok := db.cache[key]; ok && kv2.modRev > kv1.modRev {
+		// The value changed between the rlock and the wlock,
+		// so send the newer value.
+		var cloned1 interface{}
+		if kv1ok {
+			var err error
+			cloned1, err = db.clone(key, kv1.value)
+			if err != nil {
+				return fmt.Errorf("WatchKey clone %s: %w", key, err)
+			}
+		}
+		cloned2, err := db.clone(key, kv2.value)
+		if err != nil {
+			return fmt.Errorf("WatchKey clone %s: %w", key, err)
+		}
+		fn(cloned1, cloned2)
 	}
 	db.keyWatchers[key] = append(db.keyWatchers[key], w)
 	return nil
