@@ -462,21 +462,33 @@ func TestDeleteInMemory(t *testing.T) {
 
 func testDelete(t *testing.T, url string) {
 	watch := make(chan []KV, 16)
-	watchFunc := func(kv []KV) {
-		watch <- kv
+	watchFunc := func(kvs []KV) {
+		watch <- kvs
+	}
+	watchPrefix := make(chan []KV, 16)
+	watchPrefixFunc := func(kvs []KV) {
+		watchPrefix <- kvs
 	}
 	checkWatch := func(want []KV) {
 		t.Helper()
 		timer := time.NewTimer(5 * time.Second)
 		defer timer.Stop()
-		var got []KV
+		var got, gotPrefix []KV
 		select {
 		case got = <-watch:
 		case <-timer.C:
 			t.Fatalf("timeout waiting for %v", want)
 		}
+		select {
+		case gotPrefix = <-watchPrefix:
+		case <-timer.C:
+			t.Fatalf("timeout waiting for prefix watch %v", want)
+		}
 		if !cmp.Equal(got, want) {
 			t.Errorf("watch got: %v,\nwant: %v", got, want)
+		}
+		if !cmp.Equal(gotPrefix, want) {
+			t.Errorf("watch gotPrefix: %v,\nwant: %v", gotPrefix, want)
 		}
 	}
 
@@ -486,6 +498,10 @@ func testDelete(t *testing.T, url string) {
 		t.Fatal(err)
 	}
 	defer db.Close()
+
+	if err := db.WatchPrefix(ctx, "/", watchPrefixFunc); err != nil {
+		t.Fatal(err)
+	}
 
 	checkNoKey := func(tx *Tx, key string) {
 		t.Helper()
@@ -497,6 +513,30 @@ func testDelete(t *testing.T, url string) {
 		} else if got != nil {
 			t.Errorf("%s: got=%v, want nil", key, got)
 		}
+	}
+
+	var watchKeyCalls int
+	var watchKeyErr error
+	watchCtx, watchCancel := context.WithCancel(context.Background())
+	err = db.WatchKey(watchCtx, "/b/2", func(old, new interface{}) {
+		if watchKeyErr != nil {
+			return
+		}
+		watchKeyCalls++
+		switch watchKeyCalls {
+		case 1:
+			if old != nil || new == nil || string(new.([]byte)) != "b2" {
+				watchKeyErr = fmt.Errorf("watch key: old=%v, new=%v, want b2", old, new)
+			}
+		case 2:
+			if old == nil || new != nil || string(old.([]byte)) != "b2" {
+				watchKeyErr = fmt.Errorf("watch key: old=%v, new=%v, want nil", old, new)
+			}
+			watchCancel()
+		}
+	})
+	if err != nil {
+		t.Fatal(err)
 	}
 
 	tx := db.Tx(ctx)
@@ -519,6 +559,11 @@ func testDelete(t *testing.T, url string) {
 		{Key: "/b/1", Value: []byte("b1")},
 		{Key: "/b/2", Value: []byte("b2")},
 	})
+	if watchKeyErr != nil {
+		t.Fatal(err)
+	} else if watchKeyCalls != 1 {
+		t.Fatal("missing WatchKey call")
+	}
 
 	tx = db.Tx(ctx)
 	pendingUpdate := errors.New("no pending update")
@@ -549,6 +594,11 @@ func testDelete(t *testing.T, url string) {
 	checkWatch([]KV{
 		{Key: "/b/2", OldValue: []byte("b2"), Value: nil},
 	})
+	if watchKeyErr != nil {
+		t.Fatal(err)
+	} else if watchKeyCalls != 2 {
+		t.Fatal("missing WatchKey call")
+	}
 
 	tx = db.Tx(ctx)
 	tx.Put("/b/2", nil)
@@ -558,7 +608,12 @@ func testDelete(t *testing.T, url string) {
 	select {
 	case got := <-watch:
 		t.Errorf("unexpected watch result: %v", got)
+	case got := <-watchPrefix:
+		t.Errorf("unexpected watchPrefix result: %v", got)
 	default:
+	}
+	if watchKeyCalls != 2 {
+		t.Fatal("unexpected WatchKey call")
 	}
 }
 

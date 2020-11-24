@@ -65,6 +65,7 @@ import (
 	"expvar"
 	"fmt"
 	"log"
+	"math/rand"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -125,10 +126,12 @@ type DB struct {
 
 	// The following fields are guarded by Mu.
 
-	cache   map[string]valueRev     // in-memory copy of all etcd key-values
-	rev     rev                     // rev is the latest known etcd db revision
-	closing bool                    // DB.Close called
-	pending map[rev][]chan struct{} // channels to be closed when rev >= map key
+	cache          map[string]valueRev     // in-memory copy of all etcd key-values
+	rev            rev                     // rev is the latest known etcd db revision
+	closing        bool                    // DB.Close called
+	pending        map[rev][]chan struct{} // channels to be closed when rev >= map key
+	prefixWatchers map[string][]watch      // key prefix -> watch funcs
+	keyWatchers    map[string][]watch      // key -> watch funcs
 }
 
 // Options are optional settings for a DB.
@@ -254,9 +257,11 @@ func New(ctx context.Context, urls string, opts Options) (db *DB, err error) {
 	}
 
 	db = &DB{
-		opts:    opts,
-		cache:   map[string]valueRev{},
-		pending: map[rev][]chan struct{}{},
+		opts:           opts,
+		cache:          map[string]valueRev{},
+		pending:        map[rev][]chan struct{}{},
+		keyWatchers:    map[string][]watch{},
+		prefixWatchers: map[string][]watch{},
 	}
 	watchCtx, cancel := context.WithCancel(context.Background())
 	db.done = watchCtx.Done()
@@ -797,7 +802,7 @@ func (tx *Tx) commitCacheLocked(modRev rev) {
 			value:  val,
 			modRev: modRev,
 		}
-		if tx.db.opts.WatchFunc != nil {
+		if tx.db.hasWatchLocked() {
 			var cloned interface{}
 			if val != nil {
 				var err error
@@ -813,9 +818,8 @@ func (tx *Tx) commitCacheLocked(modRev rev) {
 			kvs = append(kvs, KV{Key: key, OldValue: kv.value, Value: cloned})
 		}
 	}
-	if tx.db.opts.WatchFunc != nil && len(kvs) > 0 {
-		sort.Slice(kvs, func(i, j int) bool { return kvs[i].Key < kvs[j].Key })
-		tx.db.opts.WatchFunc(kvs)
+	if tx.db.hasWatchLocked() && len(kvs) > 0 {
+		tx.db.informWatchLocked(kvs)
 	}
 }
 
@@ -933,7 +937,7 @@ func (db *DB) watchResult(res *clientv3.WatchResponse) error {
 			// Value has been deleted but we never knew about it, ignore.
 			continue
 		}
-		if db.opts.WatchFunc != nil {
+		if db.hasWatchLocked() {
 			var cloned interface{}
 			if newkv.valueRev.value != nil {
 				var err error
@@ -946,9 +950,8 @@ func (db *DB) watchResult(res *clientv3.WatchResponse) error {
 		}
 		db.cache[newkv.key] = newkv.valueRev
 	}
-	if len(kvs) > 0 {
-		sort.Slice(kvs, func(i, j int) bool { return kvs[i].Key < kvs[j].Key })
-		db.opts.WatchFunc(kvs)
+	if db.hasWatchLocked() && len(kvs) > 0 {
+		db.informWatchLocked(kvs)
 	}
 	db.rev = rev(res.Header.Revision)
 	for rev, doneChs := range db.pending {
@@ -1136,6 +1139,157 @@ func (tx *Tx) get(key string) (bool, valueRev, error) {
 		tx.cmps[key] = struct{}{}
 	}
 	return true, kv, nil
+}
+
+func (db *DB) hasWatchLocked() bool {
+	return db.opts.WatchFunc != nil || len(db.keyWatchers) > 0 || len(db.prefixWatchers) > 0
+}
+
+func (db *DB) informWatchLocked(kvs []KV) {
+	if len(kvs) == 0 {
+		panic("informWatchLocked called with no KVs")
+	}
+	sort.Slice(kvs, func(i, j int) bool { return kvs[i].Key < kvs[j].Key })
+	if db.opts.WatchFunc != nil {
+		db.opts.WatchFunc(kvs)
+	}
+
+	runWatches := func(watches []watch, kvs []KV) []watch {
+		if len(watches) == 0 {
+			return nil
+		}
+		if len(watches) > 1 {
+			rand.Shuffle(len(watches), func(i, j int) {
+				watches[i], watches[j] = watches[j], watches[i]
+			})
+		}
+		// TODO(crawshaw): implement compaction by swapping last w into
+		// current spot, nilling out last function, decrementing i,
+		// and shrinking the slice?
+		newWatches := watches[:0]
+		for _, w := range watches {
+			if w.ctx.Err() != nil {
+				continue
+			}
+			w.fn(kvs)
+			if w.ctx.Err() != nil {
+				continue
+			}
+			newWatches = append(newWatches, w)
+		}
+		tail := watches[len(newWatches):]
+		for i := range tail {
+			// Clear out old funcs so that the backing array
+			// does not pin removed watch functions.
+			tail[i] = watch{}
+		}
+		return newWatches
+	}
+
+	// Process key watchers.
+	for _, kv := range kvs {
+		db.keyWatchers[kv.Key] = runWatches(db.keyWatchers[kv.Key], []KV{kv})
+	}
+
+	// Process prefix watchers.
+	deliveries := make(map[string][]KV)
+	for _, kv := range kvs {
+		for prefix := range db.prefixWatchers {
+			if strings.HasPrefix(kv.Key, prefix) {
+				deliveries[prefix] = append(deliveries[prefix], kv)
+			}
+		}
+	}
+	for prefix, kvs := range deliveries {
+		db.prefixWatchers[prefix] = runWatches(db.prefixWatchers[prefix], kvs)
+	}
+}
+
+type watch struct {
+	ctx context.Context
+	fn  func(kvs []KV)
+}
+
+// WatchKey registers fn to be called every time a change is made to a key.
+//
+// If there is an existing value of the key it is played through fn
+// before WatchKey returns.
+//
+// The fn function is called holding either the read or write lock.
+// Do not do any operation in fn that tries to take the etcd read or
+// write lock.
+//
+// The watch is de-registered when ctx is Done.
+func (db *DB) WatchKey(ctx context.Context, key string, fn func(old, new interface{})) error {
+	w := watch{
+		ctx: ctx,
+		fn: func(kvs []KV) {
+			if len(kvs) != 1 {
+				panic(fmt.Sprintf("WatchKey callback receieved %d kvs", len(kvs)))
+			}
+			kv := kvs[0]
+			if kv.Key != key {
+				panic(fmt.Sprintf("WatchKey callback receieved wrong key %q, want %q", kv.Key, key))
+			}
+			fn(kv.OldValue, kv.Value)
+		},
+	}
+
+	db.Mu.Lock()
+	defer db.Mu.Unlock()
+	if kv, ok := db.cache[key]; ok {
+		cloned, err := db.clone(key, kv.value)
+		if err != nil {
+			return fmt.Errorf("WatchKey clone %s: %w", key, err)
+		}
+		fn(nil, cloned)
+	}
+	db.keyWatchers[key] = append(db.keyWatchers[key], w)
+	return nil
+}
+
+// WatchPrefix registers fn to be called every time a change is made to
+// a key-value with the prefix keyPrefix.
+//
+// All existing key-values matching keyPrefix are played through fn
+// before WatchPrefix returns.
+//
+// The fn function is called holding either the read or write lock.
+// Do not do any operation in fn that tries to take the etcd read or
+// write lock.
+//
+// The watch is de-registered when ctx is Done.
+//
+// The data structure storing prefix watchers is relatively inefficient
+// at present, so adding large numbers of prefix watchers is expensive.
+func (db *DB) WatchPrefix(ctx context.Context, keyPrefix string, fn func(kvs []KV)) error {
+	// errNoContinue is used internally to deregister watch functions
+	errNoContinue := errors.New("watch does not continue")
+
+	// TODO: reorganize this to more aggressively end the watch when
+	// ctx is done. (Probably by changing GetRange to use a ctx.)
+
+	// Run all existing key-values through fn.
+	fnRange := func(kv []KV) error {
+		if ctx.Err() != nil {
+			return errNoContinue
+		}
+		fn(kv)
+		return nil
+	}
+	onSuccess := func() {
+		// etcd.Mu write lock is held by GetRange
+		db.prefixWatchers[keyPrefix] = append(db.prefixWatchers[keyPrefix], watch{
+			ctx: ctx,
+			fn:  fn,
+		})
+	}
+	err := db.GetRange(keyPrefix, fnRange, onSuccess)
+	if err != nil && !errors.Is(err, errNoContinue) {
+		return fmt.Errorf("cfgdb.AddWatch: %w", err)
+	}
+	return nil
+
 }
 
 // TODO(crawshaw): type Key string ?
