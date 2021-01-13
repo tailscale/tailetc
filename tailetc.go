@@ -1,4 +1,5 @@
-// Package etcd implements an total-memory-cache etcd v3 client.
+// Package tailetc implements an total-memory-cache etcd v3 client
+// implemented by tailing (watching) an entire etcd.
 //
 // The client maintains a complete copy of the etcd database in memory,
 // with values decoded into Go objects.
@@ -57,7 +58,7 @@
 // The general ownership semantics are: objects are copied as soon as
 // they are passed to etcd, and any memory returned by etcd is owned
 // by the caller.
-package etcd
+package tailetc
 
 import (
 	"context"
