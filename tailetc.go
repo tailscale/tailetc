@@ -611,10 +611,7 @@ func (db *DB) getRange(keyPrefix string, fn func([]KV) error, min rev) error {
 		}
 	}
 	if len(kvs) > 0 {
-		if err := fn(kvs); err != nil {
-			return err
-		}
-		kvs = nil // passing ownership of kvs to fn
+		return fn(kvs)
 	}
 	return nil
 }
