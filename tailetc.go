@@ -164,7 +164,7 @@ type Options struct {
 	// the transaction has been successfully applied by the etcd server
 	// but before the Commit method returns.
 	//
-	// The DB.Mu write lock is held for the call, so no transcations
+	// The DB.Mu write lock is held for the call, so no transactions
 	// can be issued from inside WatchFunc.
 	//
 	// Entire etcd transactions are single calls to WatchFunc.
@@ -890,7 +890,7 @@ func (db *DB) watchResult(res *clientv3.WatchResponse) error {
 
 		// As a first pass, we check the cache to see if we can avoid decoding
 		// the value. This is a performance optimization, it's entirely possible
-		// the Tx commiting these values is still in-flight and will update the
+		// the Tx committing these values is still in-flight and will update the
 		// db.cache momentarily, so it is checked again below under the mutex.
 		db.Mu.RLock()
 		kv, exists := db.cache[key]
