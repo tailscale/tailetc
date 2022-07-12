@@ -68,6 +68,7 @@ import (
 	"log"
 	"math/rand"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -78,10 +79,9 @@ import (
 	"sync/atomic"
 	"time"
 
-	"go.etcd.io/etcd/clientv3"
-	"go.etcd.io/etcd/embed"
-	"go.etcd.io/etcd/mvcc/mvccpb"
-	"go.etcd.io/etcd/pkg/types"
+	"go.etcd.io/etcd/api/v3/mvccpb"
+	clientv3 "go.etcd.io/etcd/client/v3"
+	"go.etcd.io/etcd/server/v3/embed"
 	"tailscale.com/syncs"
 )
 
@@ -274,16 +274,17 @@ func New(ctx context.Context, urls string, opts Options) (db *DB, err error) {
 	}
 	var eps []string
 	if strings.HasPrefix(urls, "file://") {
-		randURLs, err := types.NewURLs([]string{"http://127.0.0.1:0"})
+		u, err := url.Parse("http://127.0.0.1:0")
 		if err != nil {
 			return nil, err
 		}
+		clientUrls := []url.URL{*u}
 
 		cfg := embed.NewConfig()
-		cfg.LCUrls = randURLs
-		cfg.ACUrls = randURLs
-		cfg.LPUrls = randURLs
-		cfg.APUrls = randURLs
+		cfg.LCUrls = clientUrls
+		cfg.ACUrls = clientUrls
+		cfg.LPUrls = clientUrls
+		cfg.APUrls = clientUrls
 		cfg.InitialCluster = cfg.InitialClusterFromName(cfg.Name)
 		cfg.Dir = filepath.Join(strings.TrimPrefix(urls, "file://"), "tailscale.etcd")
 		cfg.Logger = "zap" // set to avoid data race in the default logger
